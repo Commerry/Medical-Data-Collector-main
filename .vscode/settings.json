@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cd \"/Users/KoBon/repos/Medical Data Collector\" && npm install$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^lsof -n -iTCP:3000 -sTCP:LISTEN$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

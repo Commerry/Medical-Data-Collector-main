@@ -1,0 +1,9 @@
+node_modules
+.next
+out
+electron-dist
+.env
+.DS_Store
+logs
+/data
+dist/

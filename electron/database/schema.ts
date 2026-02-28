@@ -1,0 +1,81 @@
+export const sqliteSchemaStatements = [
+  `CREATE TABLE IF NOT EXISTS app_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    config_key TEXT UNIQUE NOT NULL,
+    config_value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );`,
+  `CREATE TABLE IF NOT EXISTS mqtt_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic TEXT NOT NULL,
+    device_type TEXT NOT NULL,
+    idcard TEXT,
+    payload TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    processed BOOLEAN DEFAULT 0,
+    status TEXT DEFAULT 'received',
+    error_message TEXT
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_mqtt_idcard ON mqtt_log (idcard);`,
+  `CREATE INDEX IF NOT EXISTS idx_mqtt_timestamp ON mqtt_log (timestamp);`,
+  `CREATE INDEX IF NOT EXISTS idx_mqtt_status ON mqtt_log (status);`,
+  `CREATE TABLE IF NOT EXISTS pending_cardreader (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idcard TEXT NOT NULL,
+    timestamp TEXT,
+    status TEXT DEFAULT 'pending',
+    error_message TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_pending_cardreader_idcard ON pending_cardreader (idcard);`,
+  `CREATE INDEX IF NOT EXISTS idx_pending_cardreader_status ON pending_cardreader (status);`,
+  `CREATE TABLE IF NOT EXISTS pending_measurements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idcard TEXT NOT NULL,
+    device_type TEXT NOT NULL,
+    value TEXT,
+    measured_at TEXT,
+    status TEXT DEFAULT 'pending',
+    attempt_count INTEGER DEFAULT 0,
+    max_attempts INTEGER DEFAULT 3,
+    last_error TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_pending_measurements_idcard ON pending_measurements (idcard);`,
+  `CREATE INDEX IF NOT EXISTS idx_pending_measurements_status ON pending_measurements (status);`,
+  `CREATE TABLE IF NOT EXISTS active_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idcard TEXT UNIQUE,
+    pid INTEGER,
+    pcucode TEXT,
+    pcucodeperson TEXT,
+    visitno INTEGER,
+    visitdate DATE,
+    weight REAL,
+    height REAL,
+    pressure TEXT,
+    temperature REAL,
+    pulse INTEGER,
+    session_start DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_update DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_synced BOOLEAN DEFAULT 0,
+    is_temp BOOLEAN DEFAULT 0
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_sessions_idcard ON active_sessions (idcard);`,
+  `CREATE INDEX IF NOT EXISTS idx_sessions_synced ON active_sessions (is_synced);`,
+  `CREATE TABLE IF NOT EXISTS sync_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER,
+    idcard TEXT NOT NULL,
+    visitno INTEGER,
+    fields_updated TEXT,
+    sync_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    sync_status TEXT DEFAULT 'success',
+    error_message TEXT,
+    FOREIGN KEY (session_id) REFERENCES active_sessions(id)
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_sync_timestamp ON sync_history (sync_timestamp);`,
+  `CREATE INDEX IF NOT EXISTS idx_sync_status ON sync_history (sync_status);`
+];
