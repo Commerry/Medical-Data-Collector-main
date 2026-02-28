@@ -17,9 +17,22 @@
 #include <ArduinoJson.h>
 #include "Config.h"  // ไฟล์ Configuration แยกต่างหาก
 
+// ===== LED PINS =====
+#ifdef ESP32
+  #define RED_LED_PIN 4     // GPIO4 - แดง: แสดงสถานะอุปกรณ์
+  #define GREEN_LED_PIN 2   // GPIO2 - เขียว: กระพริบเมื่อรับข้อมูล
+#elif defined(ESP8266)
+  #define RED_LED_PIN D1    // D1 - แดง
+  #define GREEN_LED_PIN D4  // D4 (GPIO2 - Built-in LED) - เขียว
+#endif
+
 // ===== VARIABLES =====
 String macAddress;
 unsigned long lastCleanup = 0;
+unsigned long lastRedBlink = 0;
+int redBlinkCount = 0;
+bool redBlinkState = false;
+int currentBlinkNumber = 0;
 
 // WiFi Event Handler
 #ifdef ESP32
@@ -76,6 +89,10 @@ void updateDevice(String deviceId, String deviceName, String mac);
 void cleanupOfflineDevices();
 void sendToSerial(String jsonString);
 void printDeviceList();
+void setupLEDs();
+void updateRedLED();
+void blinkGreenLED();
+int getOnlineDeviceCount();
 
 // ===== SETUP =====
 void setup() {
@@ -99,6 +116,9 @@ void setup() {
   
   // เริ่ม Soft AP พร้อม IP ที่กำหนด
   setupSoftAP();
+  
+  // ตั้งค่า LED
+  setupLEDs();
   
   // แสดง MAC Address
   macAddress = WiFi.softAPmacAddress();
@@ -129,6 +149,9 @@ void setup() {
 void loop() {
   // จัดการ HTTP requests
   server.handleClient();
+  
+  // อัพเดท LED แดง - กระพริบตามจำนวนอุปกรณ์
+  updateRedLED();
   
   // แสดงสถานะ AP ทุก 5 วินาที
   static unsigned long lastClientCheck = 0;
@@ -346,6 +369,9 @@ void handleVitals() {
   // อัพเดทสถานะอุปกรณ์
   updateDevice(deviceId, deviceName, mac);
   
+  // กระพริบ LED เขียว เมื่อได้รับข้อมูล
+  blinkGreenLED();
+  
   // ส่งข้อมูลไปยัง Serial (คอมพิวเตอร์จะอ่าน)
   sendToSerial(body);
   
@@ -411,6 +437,9 @@ void handleDeviceStatus() {
   
   // อัพเดทสถานะอุปกรณ์
   updateDevice(deviceId, deviceName, mac);
+  
+  // กระพริบ LED เขียว เมื่อได้รับข้อมูล
+  blinkGreenLED();
   
   // ส่งข้อมูลไปยัง Serial (คอมพิวเตอร์จะอ่าน)
   sendToSerial(body);
@@ -570,4 +599,88 @@ void printDeviceList() {
   Serial.print(onlineCount);
   Serial.println(" online)");
   Serial.println("========================\n");
+}
+
+// ===== SETUP LEDS =====
+void setupLEDs() {
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  
+  // ทดสอบ LED ตอนเริ่มต้น
+  digitalWrite(RED_LED_PIN, HIGH);
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  delay(500);
+  digitalWrite(RED_LED_PIN, LOW);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  delay(500);
+  
+  // เริ่มต้นด้วยไฟแดงติด (ไม่มีอุปกรณ์)
+  digitalWrite(RED_LED_PIN, HIGH);
+  
+  Serial.println("✓ LED initialized");
+  Serial.printf("  Red LED: GPIO%d\n", RED_LED_PIN);
+  Serial.printf("  Green LED: GPIO%d\n", GREEN_LED_PIN);
+}
+
+// ===== GET ONLINE DEVICE COUNT =====
+int getOnlineDeviceCount() {
+  int count = 0;
+  #ifdef ESP32
+    for (const auto &device : connectedDevices) {
+      if (device.online) count++;
+    }
+  #else
+    for (int i = 0; i < deviceCount; i++) {
+      if (connectedDevices[i].online) count++;
+    }
+  #endif
+  return count;
+}
+
+// ===== UPDATE RED LED =====
+void updateRedLED() {
+  int onlineCount = getOnlineDeviceCount();
+  unsigned long now = millis();
+  
+  if (onlineCount == 0) {
+    // ไม่มีอุปกรณ์ - ไฟแดงติดค้าง
+    digitalWrite(RED_LED_PIN, HIGH);
+    redBlinkCount = 0;
+    currentBlinkNumber = 0;
+    return;
+  }
+  
+  // มีอุปกรณ์เชื่อมต่อ - กระพริบตามจำนวน
+  if (redBlinkCount == 0) {
+    // เริ่มรอบใหม่
+    if (now - lastRedBlink >= 5000) {  // รอ 5 วินาที
+      redBlinkCount = onlineCount * 2;  // *2 เพราะมีทั้ง ON และ OFF
+      currentBlinkNumber = 0;
+      lastRedBlink = now;
+      redBlinkState = true;
+      digitalWrite(RED_LED_PIN, HIGH);
+    } else {
+      digitalWrite(RED_LED_PIN, LOW);
+    }
+  } else {
+    // กำลังกระพริบ
+    if (now - lastRedBlink >= 200) {  // กระพริบเร็ว 200ms
+      redBlinkState = !redBlinkState;
+      digitalWrite(RED_LED_PIN, redBlinkState ? HIGH : LOW);
+      lastRedBlink = now;
+      redBlinkCount--;
+      
+      if (!redBlinkState) {
+        currentBlinkNumber++;
+      }
+    }
+  }
+}
+
+// ===== BLINK GREEN LED =====
+void blinkGreenLED() {
+  // กระพริบสั้นๆ เมื่อได้รับข้อมูล
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  delay(100);
+  digitalWrite(GREEN_LED_PIN, LOW);
 }

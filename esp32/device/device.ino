@@ -14,6 +14,13 @@
 
 #include <ArduinoJson.h>
 
+// ===== LED PIN =====
+#ifdef ESP32
+  #define GREEN_LED_PIN 2   // GPIO2 - Built-in LED
+#elif defined(ESP8266)
+  #define GREEN_LED_PIN D4  // D4 (GPIO2 - Built-in LED)
+#endif
+
 // ===== CONFIGURATION =====
 const char* CENTER_SSID = "MEDICAL_CENTER_01"; // ชื่อ WiFi ของ Center
 const char* CENTER_PASSWORD = "Abc123**";      // รหัสผ่าน WiFi
@@ -38,12 +45,17 @@ String macAddress;
 bool wifiConnected = false;
 unsigned long lastStatusSend = 0;
 const unsigned long STATUS_INTERVAL = 3000;     // ส่งสถานะทุก 3 วินาที (เรียลไทม์)
+unsigned long lastLedBlink = 0;
+bool ledBlinkState = false;
 
 // ===== FUNCTION DECLARATIONS =====
 void connectWiFi();
 bool sendHTTPPost(String endpoint, String jsonData);
 void sendDeviceStatus();
 void sendVitalsData(const char* idcard, const char* deviceType, float value);
+void setupLED();
+void updateLED();
+void blinkLEDOnce();
 
 // ===== SETUP =====
 void setup() {
@@ -66,6 +78,9 @@ void setup() {
   Serial.println(DEVICE_ID);
   Serial.print("Device Name: ");
   Serial.println(DEVICE_NAME);
+  
+  // ตั้งค่า LED
+  setupLED();
   
   // เชื่อมต่อ WiFi
   connectWiFi();
@@ -90,6 +105,9 @@ void loop() {
     wifiConnected = true;
     Serial.println("✓ WiFi reconnected!");
   }
+  
+  // อัพเดท LED
+  updateLED();
   
   // ส่งสถานะอุปกรณ์เป็นระยะ
   if (wifiConnected && (millis() - lastStatusSend > STATUS_INTERVAL)) {
@@ -357,6 +375,10 @@ bool sendHTTPPost(String endpoint, String jsonData) {
       http.end();
       Serial.println("✅ HTTP Request Successful");
       Serial.println("--- END HTTP REQUEST ---\n");
+      
+      // กระพริบ LED เมื่อส่งข้อมูลสำเร็จ
+      blinkLEDOnce();
+      
       return true;
     } else {
       Serial.print("❌ HTTP Error: ");
@@ -393,6 +415,10 @@ bool sendHTTPPost(String endpoint, String jsonData) {
       http.end();
       Serial.println("✅ HTTP Request Successful");
       Serial.println("--- END HTTP REQUEST ---\n");
+      
+      // กระพริบ LED เมื่อส่งข้อมูลสำเร็จ
+      blinkLEDOnce();
+      
       return true;
     } else {
       Serial.print("❌ HTTP Error code: ");
@@ -464,4 +490,111 @@ void sendVitalsData(const char* idcard, const char* deviceType, float value) {
   } else {
     Serial.println("✗ Failed to send vitals data");
   }
+}
+
+// ===== SETUP LED =====
+void setupLED() {
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  
+  // ทดสอบตอนเริ่มต้น: ติดแล้วดับ
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  delay(500);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  
+  Serial.println("✓ LED initialized");
+  #ifdef ESP32
+    Serial.printf("  Green LED: GPIO%d\n", GREEN_LED_PIN);
+  #else
+    Serial.print("  Green LED: GPIO");
+    Serial.println(GREEN_LED_PIN);
+  #endif
+}
+
+// ===== UPDATE LED =====
+void updateLED() {
+  if (!wifiConnected) {
+    // ไม่ได้เชื่อมต่อ - ดับ LED
+    digitalWrite(GREEN_LED_PIN, LOW);
+    return;
+  }
+  
+  // เชื่อมต่อแล้ว - กระพริบทุก 1 วิ ดับ 5 วิ
+  unsigned long now = millis();
+  unsigned long interval = 6000;  // 1วิ + 5วิ = 6 วินาที
+  unsigned long elapsed = now - lastLedBlink;
+  
+  if (elapsed < 1000) {
+    // 1 วินาทีแรก - ติด
+    digitalWrite(GREEN_LED_PIN, HIGH);
+  } else if (elapsed >= interval) {
+    // ครบ 6 วินาทีแล้ว - รีเซ็ต
+    lastLedBlink = now;
+  } else {
+    // ดับอยู่ 5 วินาที
+    digitalWrite(GREEN_LED_PIN, LOW);
+  }
+}
+
+// ===== BLINK LED ONCE =====
+void blinkLEDOnce() {
+  // กระพริบสั้นๆ 1 ชุด (3 ครั้งเร็ว)
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    delay(100);
+  }
+  // รีเซ็ตตัวจับเวลาสำหรับการกระพริบปกติ
+  lastLedBlink = millis();
+}
+
+// ===== SETUP LED =====
+void setupLED() {
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  
+  // ทดสอบตอนเริ่มต้น: ติดแล้วดับ
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  delay(500);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  
+  Serial.println("✓ LED initialized");
+  Serial.printf("  Green LED: GPIO%d\n", GREEN_LED_PIN);
+}
+
+// ===== UPDATE LED =====
+void updateLED() {
+  if (!wifiConnected) {
+    // ไม่ได้เชื่อมต่อ - ดับ LED
+    digitalWrite(GREEN_LED_PIN, LOW);
+    return;
+  }
+  
+  // เชื่อมต่อแล้ว - กระพริบทุก 1 วิ ดับ 5 วิ
+  unsigned long now = millis();
+  unsigned long interval = 6000;  // 1วิ + 5วิ = 6 วินาที
+  unsigned long elapsed = now - lastLedBlink;
+  
+  if (elapsed < 1000) {
+    // 1 วินาทีแรก - ติด
+    digitalWrite(GREEN_LED_PIN, HIGH);
+  } else if (elapsed >= interval) {
+    // ครบ 6 วินาทีแล้ว - รีเซ็ต
+    lastLedBlink = now;
+  } else {
+    // ดับอยู่ 5 วินาที
+    digitalWrite(GREEN_LED_PIN, LOW);
+  }
+}
+
+// ===== BLINK LED ONCE =====
+void blinkLEDOnce() {
+  // กระพริบสั้นๆ 1 ชุด (3 ครั้งเร็ว)
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    delay(100);
+  }
+  // รีเซ็ตตัวจับเวลาสำหรับการกระพริบปกติ
+  lastLedBlink = millis();
 }

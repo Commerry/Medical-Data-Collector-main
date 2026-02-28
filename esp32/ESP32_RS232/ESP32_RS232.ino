@@ -70,6 +70,13 @@
 #include "Config.h"
 #include "RS232Reader.h"
 
+// ===== LED PIN =====
+#ifdef ESP32
+  #define GREEN_LED_PIN 2   // GPIO2 - Built-in LED
+#elif defined(ESP8266)
+  #define GREEN_LED_PIN D4  // D4 (GPIO2 - Built-in LED)
+#endif
+
 // ===== Button Pins =====
 #ifdef ESP32
   #define BOOT_BTN 0      // GPIO0 (BOOT button)
@@ -79,6 +86,8 @@
 
 unsigned long lastButtonCheck = 0;
 int httpPostCount = 0;
+unsigned long lastLedBlink = 0;
+bool ledBlinkState = false;
 
 // ===== ฟังก์ชันส่งข้อมูลแต่ละ Field ผ่าน HTTP POST =====
 void sendHTTPPost(String deviceType, float value) {
@@ -127,6 +136,9 @@ void sendHTTPPost(String deviceType, float value) {
     Serial.printf("✅ ส่งข้อมูล #%d สำเร็จ\n", httpPostCount);
     Serial.printf("   Type: %s\n", deviceType.c_str());
     Serial.printf("   Value: %.1f\n", value);
+    
+    // กระพริบ LED เมื่อส่งข้อมูลสำเร็จ
+    blinkLEDOnce();
   } else if (httpCode > 0) {
     Serial.printf("❌ HTTP Error: %d\n", httpCode);
     Serial.printf("   URL: %s\n", url.c_str());
@@ -213,6 +225,9 @@ void setup() {
   // ตั้งค่าปุ่ม Reset
   pinMode(BOOT_BTN, INPUT_PULLUP);
   
+  // ตั้งค่า LED
+  setupLED();
+  
   #ifdef ESP32
     Serial.println("💡 กดปุ่ม BOOT ค้าง 3 วินาที = Reset Config\n");
   #elif defined(ESP8266)
@@ -263,6 +278,9 @@ void loop() {
     }
   }
   
+  // อัพเดท LED
+  updateLED();
+  
   // ตรวจสอบปุ่ม BOOT/D2 กดค้าง 3 วินาที = Reset Config
   if (digitalRead(BOOT_BTN) == LOW) {
     if (millis() - lastButtonCheck > 3000) {
@@ -299,4 +317,60 @@ void loop() {
   RS232_loop();
   
   delay(10);
+}
+
+// ===== SETUP LED =====
+void setupLED() {
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  
+  // ทดสอบตอนเริ่มต้น: ติดแล้วดับ
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  delay(500);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  
+  Serial.println("✓ LED initialized");
+  #ifdef ESP32
+    Serial.printf("  Green LED: GPIO%d\n", GREEN_LED_PIN);
+  #else
+    Serial.print("  Green LED: GPIO");
+    Serial.println(GREEN_LED_PIN);
+  #endif
+}
+
+// ===== UPDATE LED =====
+void updateLED() {
+  if (WiFi.status() != WL_CONNECTED) {
+    // ไม่ได้เชื่อมต่อ - ดับ LED
+    digitalWrite(GREEN_LED_PIN, LOW);
+    return;
+  }
+  
+  // เชื่อมต่อแล้ว - กระพริบทุก 1 วิ ดับ 5 วิ
+  unsigned long now = millis();
+  unsigned long interval = 6000;  // 1วิ + 5วิ = 6 วินาที
+  unsigned long elapsed = now - lastLedBlink;
+  
+  if (elapsed < 1000) {
+    // 1 วินาทีแรก - ติด
+    digitalWrite(GREEN_LED_PIN, HIGH);
+  } else if (elapsed >= interval) {
+    // ครบ 6 วินาทีแล้ว - รีเซ็ต
+    lastLedBlink = now;
+  } else {
+    // ดับอยู่ 5 วินาที
+    digitalWrite(GREEN_LED_PIN, LOW);
+  }
+}
+
+// ===== BLINK LED ONCE =====
+void blinkLEDOnce() {
+  // กระพริบสั้นๆ 1 ชุด (3 ครั้งเร็ว)
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(GREEN_LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    delay(100);
+  }
+  // รีเซ็ตตัวจับเวลาสำหรับการกระพริบปกติ
+  lastLedBlink = millis();
 }
