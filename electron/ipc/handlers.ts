@@ -14,6 +14,7 @@ export type IpcContext = {
   getConfig: () => AppConfig;
   setConfig: (partial: Partial<AppConfig>) => void;
   updateMySqlPool: (config: AppConfig["database"]) => void;
+  restartSerialPort: (config: AppConfig["serial"]) => Promise<void>;
   // getBrokerStatus: () => { running: boolean; port: number };
   // getBrokerClients: () => { clientId: string; ip: string | null }[];
   getSerialStatus: () => { connected: boolean; portName: string };
@@ -25,12 +26,20 @@ export type IpcContext = {
 export const registerIpcHandlers = (ipcMain: IpcMain, ctx: IpcContext) => {
   ipcMain.handle(IPC_CHANNELS.CONFIG_GET_ALL, () => ctx.getConfig());
 
-  ipcMain.handle(IPC_CHANNELS.CONFIG_SET, (_event, partial: Partial<AppConfig>) => {
+  ipcMain.handle(IPC_CHANNELS.CONFIG_SET, async (_event, partial: Partial<AppConfig>) => {
     ctx.setConfig(partial);
     const config = ctx.getConfig();
+    
+    // Restart MySQL pool if database config changed
     if (partial.database) {
       ctx.updateMySqlPool(config.database);
     }
+    
+    // Restart serial port if serial config changed
+    if (partial.serial) {
+      await ctx.restartSerialPort(config.serial);
+    }
+    
     return config;
   });
 
@@ -72,6 +81,33 @@ export const registerIpcHandlers = (ipcMain: IpcMain, ctx: IpcContext) => {
   ipcMain.handle(IPC_CHANNELS.SERIAL_GET_PORTS, async () => {
     const ports = await listSerialPorts();
     return ports;
+  });
+  
+  ipcMain.handle(IPC_CHANNELS.SERIAL_TEST_DEVICE, async (_event, deviceId: string) => {
+    try {
+      const devices = ctx.getSerialDevices();
+      const device = devices.find(d => d.deviceId === deviceId);
+      if (!device) {
+        return { success: false, message: "Device not found" };
+      }
+      // Test โดยการเช็คว่า device online และ lastSeen ใหม่กว่า 10 วินาที
+      const timeSinceLastSeen = Date.now() - new Date(device.lastSeen).getTime();
+      const isRecent = timeSinceLastSeen < 10000; // 10 seconds
+      
+      return {
+        success: device.online && isRecent,
+        message: device.online && isRecent 
+          ? "Device is online and responding" 
+          : device.online 
+            ? `Device inactive for ${Math.round(timeSinceLastSeen / 1000)}s`
+            : "Device is offline",
+        lastSeen: device.lastSeen,
+        timeSinceLastSeen
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      return { success: false, message };
+    }
   });
 
   ipcMain.handle(IPC_CHANNELS.SESSION_GET_ACTIVE, () => {

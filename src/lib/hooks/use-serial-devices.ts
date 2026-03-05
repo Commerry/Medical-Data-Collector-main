@@ -17,23 +17,34 @@ export const useSerialDevices = () => {
   useEffect(() => {
     let mounted = true;
 
-    // Get initial devices
-    ipc.invoke<SerialDevice[]>("serial:get-devices").then((data) => {
+    // Load initial devices
+    const loadDevices = async () => {
+      const data = await ipc.invoke<SerialDevice[]>("serial:get-devices");
       if (mounted) {
         setDevices(data || []);
       }
-    });
+    };
 
-    // Listen for device updates
+    loadDevices();
+
+    // Listen for real-time updates
     const unsubscribe = ipc.on<SerialDevice[]>("serial:devices-updated", (data) => {
       if (mounted) {
         setDevices(data || []);
       }
     });
 
+    // Polling เพิ่มเติมทุก 5 วินาที เพื่อให้แน่ใจว่าได้ข้อมูลล่าสุดเสมอ
+    const pollInterval = setInterval(() => {
+      if (mounted) {
+        loadDevices();
+      }
+    }, 5000);
+
     return () => {
       mounted = false;
       unsubscribe();
+      clearInterval(pollInterval);
     };
   }, []);
 

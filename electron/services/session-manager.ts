@@ -50,19 +50,26 @@ export const handleCardReader = async (
   };
 
   const incomingIdcard = normalizeIdcard(payload.idcard);
+  console.log("[SESSION-MGR] ========== handleCardReader START ==========");
+  console.log("[SESSION-MGR] Incoming idcard:", incomingIdcard);
   if (!incomingIdcard) {
+    console.log("[SESSION-MGR] ERROR: Invalid idcard (empty or null)");
     return { ok: false, reason: "invalid_idcard" };
   }
 
+  console.log("[SESSION-MGR] Querying person table where idcard=", incomingIdcard);
   const personRows = await mysqlQuery<PersonRecord[]>(
     mysqlPool,
     "SELECT pid, pcucodeperson FROM person WHERE idcard = ?",
     [incomingIdcard]
   );
+  console.log("[SESSION-MGR] Person query returned:", personRows.length, "rows");
   const person = personRows[0];
   if (!person) {
+    console.log("[SESSION-MGR] ERROR: Person NOT FOUND in database for idcard:", incomingIdcard);
     return { ok: false, reason: "person_not_found" };
   }
+  console.log("[SESSION-MGR] Person FOUND - PID:", person.pid, "PCU:", person.pcucodeperson);
 
   // If the current active session already matches this idcard, just refresh metadata.
   // This prevents "resetting" the session when the card is scanned repeatedly.
@@ -84,6 +91,8 @@ export const handleCardReader = async (
   const currentIsTemp = Boolean((currentSession as any)?.is_temp);
 
   if (currentSession && !currentIsTemp && currentIdcard && currentIdcard === incomingIdcard) {
+    console.log("[SESSION-MGR] Same idcard as current session - refreshing");
+    console.log("[SESSION-MGR] Querying visit table where pcucodeperson=", person.pcucodeperson, "pid=", person.pid, "visitdate=CURDATE()");
     const visitRows = await mysqlQuery<VisitRecord[]>(
       mysqlPool,
       `SELECT pcucode, visitno, visitdate
@@ -93,9 +102,11 @@ export const handleCardReader = async (
        LIMIT 1`,
       [person.pcucodeperson, person.pid]
     );
+    console.log("[SESSION-MGR] Visit query returned:", visitRows.length, "rows");
     const visit = visitRows[0];
 
     if (!visit) {
+      console.log("[SESSION-MGR] WARNING: Visit NOT FOUND for today (pendingVisit=true)");
       sqliteRun(
         sqlite,
         `UPDATE active_sessions
@@ -107,6 +118,8 @@ export const handleCardReader = async (
       return { ok: true, person, visit: null, pendingVisit: true };
     }
 
+    console.log("[SESSION-MGR] Visit FOUND - visitno:", visit.visitno, "pcucode:", visit.pcucode);
+    console.log("[SESSION-MGR] Updating active_sessions with PID and Visit data");
     sqliteRun(
       sqlite,
       `UPDATE active_sessions
@@ -181,7 +194,7 @@ export const handleCardReader = async (
           sqlite,
           `UPDATE active_sessions
            SET idcard = ?, pid = ?, pcucodeperson = ?, pcucode = NULL, visitno = NULL, visitdate = NULL,
-               weight = NULL, height = NULL, pressure = NULL, temperature = NULL, pulse = NULL,
+               weight = NULL, height = NULL, pressure = NULL, pressure2 = NULL, temperature = NULL, pulse = NULL,
                is_temp = 0, session_start = datetime('now'), last_update = datetime('now')
            WHERE id = ?`,
           [incomingIdcard, person.pid, person.pcucodeperson, sessionToReuse.id]
@@ -224,7 +237,7 @@ export const handleCardReader = async (
         sqlite,
         `UPDATE active_sessions
          SET idcard = ?, pid = ?, pcucode = ?, pcucodeperson = ?, visitno = ?, visitdate = ?,
-             weight = NULL, height = NULL, pressure = NULL, temperature = NULL, pulse = NULL,
+             weight = NULL, height = NULL, pressure = NULL, pressure2 = NULL, temperature = NULL, pulse = NULL,
              is_temp = 0, session_start = datetime('now'), last_update = datetime('now')
          WHERE id = ?`,
         [
@@ -264,6 +277,8 @@ export const handleVitalSign = async (
   payload: VitalPayload
 ) => {
   const hasIdcard = Boolean(payload.idcard && payload.idcard.trim());
+  console.log(`[VITAL-SIGN] Processing ${payload.deviceType}, value=${payload.value}, idcard=${payload.idcard || '(none)'}`);
+  
   let session:
     | {
         id: number;
@@ -275,6 +290,7 @@ export const handleVitalSign = async (
     | undefined;
 
   if (hasIdcard) {
+    console.log(`[VITAL-SIGN] Looking for session with idcard=${payload.idcard}`);
     session = sqliteGet<{
       id: number;
       pcucode: string | null;
@@ -287,6 +303,7 @@ export const handleVitalSign = async (
       [payload.idcard]
     );
   } else {
+    console.log(`[VITAL-SIGN] No idcard provided, using latest active session`);
     try {
       session = sqliteGet<{
         id: number;
@@ -315,6 +332,9 @@ export const handleVitalSign = async (
          ORDER BY last_update DESC
          LIMIT 1`
       );
+    }
+    if (session) {
+      console.log(`[VITAL-SIGN] Found session id=${session.id}, idcard=${session.idcard || '(none)'}, is_temp=${session.is_temp}`);
     }
   }
 
@@ -385,15 +405,66 @@ export const handleVitalSign = async (
     return { ok: false, reason: "unsupported_device_type", deviceType: payload.deviceType };
   }
   
-  sqliteRun(
-    sqlite,
-    `UPDATE active_sessions
-     SET ${fieldName} = ?, last_update = datetime('now')
-     WHERE id = ?`,
-    [payload.value, session.id]
-  );
+  // Special handling for BP: check if we should stamp to pressure or pressure2
+  if (payload.deviceType === "bp" || payload.deviceType === "bp2") {
+    // For MySQL, check if pressure already has a value
+    // If yes, we should stamp to pressure2 instead
+    // This is handled by resolveBpMySqlField in data-processor
+    
+    // For SQLite active_sessions display, just store the value as-is
+    sqliteRun(
+      sqlite,
+      `UPDATE active_sessions
+       SET ${fieldName} = ?, last_update = datetime('now')
+       WHERE id = ?`,
+      [payload.value, session.id]
+    );
+    
+    return { ok: true, session, fieldName };
+  }
+  // Pulse: always overwrite the existing value
+  else if (payload.deviceType === "pulse") {
+    sqliteRun(
+      sqlite,
+      `UPDATE active_sessions
+       SET ${fieldName} = ?, last_update = datetime('now')
+       WHERE id = ?`,
+      [payload.value, session.id]
+    );
+    
+    return { ok: true, session, fieldName };
+  }
+  // Normal field update for other measurements (weight, height, temperature)
+  else {
+    console.log(`[VITAL-SIGN] Updating session id=${session.id}, field=${fieldName}, value=${payload.value}, idcard=${session.idcard || '(none)'}`);
+    
+    // Verify session before update
+    const beforeUpdate = sqliteGet<{ weight: any, height: any, temperature: any, pressure: any, idcard: string }>(
+      sqlite,
+      'SELECT weight, height, temperature, pressure, idcard FROM active_sessions WHERE id = ?',
+      [session.id]
+    );
+    console.log(`[VITAL-SIGN] Before update - session=${JSON.stringify(beforeUpdate)}`);
+    
+    sqliteRun(
+      sqlite,
+      `UPDATE active_sessions
+       SET ${fieldName} = ?, last_update = datetime('now')
+       WHERE id = ?`,
+      [payload.value, session.id]
+    );
+    
+    // Verify after update
+    const afterUpdate = sqliteGet<{ weight: any, height: any, temperature: any, pressure: any, idcard: string }>(
+      sqlite,
+      'SELECT weight, height, temperature, pressure, idcard FROM active_sessions WHERE id = ?',
+      [session.id]
+    );
+    console.log(`[VITAL-SIGN] After update - session=${JSON.stringify(afterUpdate)}`);
+    console.log(`[VITAL-SIGN] ✓ Successfully updated ${fieldName} in session id=${session.id}`);
 
-  return { ok: true, session, fieldName };
+    return { ok: true, session, fieldName };
+  }
 };
 
 export const getFieldName = (deviceType: VitalPayload["deviceType"]): string | null => {
@@ -403,8 +474,9 @@ export const getFieldName = (deviceType: VitalPayload["deviceType"]): string | n
     case "height":
       return "height";
     case "bp":
-    case "bp2":  // bp2 แมปไปที่ pressure เหมือน bp (ให้ data-processor จัดการ pressure/pressure2)
       return "pressure";
+    case "bp2":
+      return "pressure2";
     case "temp":
       return "temperature";
     case "pulse":

@@ -14,6 +14,7 @@ export type ActiveSession = {
   weight?: number | null;
   height?: number | null;
   pressure?: string | null;
+  pressure2?: string | null;
   temperature?: number | null;
   pulse?: number | null;
   session_start: string;

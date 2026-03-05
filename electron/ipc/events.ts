@@ -10,6 +10,7 @@ export const IPC_CHANNELS = {
   SERIAL_GET_STATUS: "serial:get-status",
   SERIAL_GET_DEVICES: "serial:get-devices",
   SERIAL_GET_PORTS: "serial:get-ports",
+  SERIAL_TEST_DEVICE: "serial:test-device",
   SESSION_GET_ACTIVE: "session:get-active",
   SESSION_GET_ALL: "session:get-all",
   HISTORY_GET_VISITS: "history:get-visits",
@@ -26,7 +27,9 @@ export const IPC_EVENTS = {
   MYSQL_STATUS: "mysql:status",
   // MQTT_CLIENTS_UPDATED: "mqtt:clients-updated"
   SERIAL_DEVICES_UPDATED: "serial:devices-updated",
-  SERIAL_STATUS: "serial:status"
+  SERIAL_STATUS: "serial:status",
+  SERIAL_DEVICE_TEST_RESULT: "serial:device-test-result",
+  TOAST_SHOW: "toast:show"
 } as const;
 
 export type IpcEvent = (typeof IPC_EVENTS)[keyof typeof IPC_EVENTS];

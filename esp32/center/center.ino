@@ -331,8 +331,6 @@ void handleVitals() {
   String mac = doc["macAddress"].as<String>();
   String deviceType = doc["deviceType"].as<String>();
   String idcard = doc["idcard"].as<String>();
-  float value = doc["data"]["value"].as<float>();
-  unsigned long timestamp = doc["data"]["timestamp"].as<unsigned long>();
   
   // แสดงข้อมูลแบบละเอียด
   Serial.println("--- PARSED DATA ---");
@@ -346,24 +344,64 @@ void handleVitals() {
   Serial.println(deviceType);
   Serial.print("  ID Card:     ");
   Serial.println(idcard);
-  Serial.print("  Value:       ");
-  Serial.print(value);
   
-  // แสดงหน่วยตามประเภทข้อมูล
-  if (deviceType == "bp" || deviceType == "bp2") {
+  // Handle combined measurements (weight_height, blood_pressure)
+  if (deviceType == "weight_height") {
+    float weight = doc["data"]["weight"].as<float>();
+    float height = doc["data"]["height"].as<float>();
+    unsigned long timestamp = doc["data"]["timestamp"].as<unsigned long>();
+    
+    Serial.print("  Weight:      ");
+    Serial.print(weight);
+    Serial.println(" kg");
+    Serial.print("  Height:      ");
+    Serial.print(height);
+    Serial.println(" cm");
+    Serial.print("  Timestamp:   ");
+    Serial.println(timestamp);
+  }
+  else if (deviceType == "blood_pressure") {
+    int bp = doc["data"]["bp"].as<int>();
+    int bp2 = doc["data"]["bp2"].as<int>();
+    int pulse = doc["data"]["pulse"].as<int>();
+    unsigned long timestamp = doc["data"]["timestamp"].as<unsigned long>();
+    
+    Serial.print("  BP:          ");
+    Serial.print(bp);
+    Serial.print("/");
+    Serial.print(bp2);
     Serial.println(" mmHg");
-  } else if (deviceType == "temp") {
-    Serial.println(" °C");
-  } else if (deviceType == "pulse") {
+    Serial.print("  Pulse:       ");
+    Serial.print(pulse);
     Serial.println(" bpm");
-  } else if (deviceType == "spo2") {
-    Serial.println(" %");
-  } else {
-    Serial.println();
+    Serial.print("  Timestamp:   ");
+    Serial.println(timestamp);
+  }
+  else {
+    // Single value measurement
+    float value = doc["data"]["value"].as<float>();
+    unsigned long timestamp = doc["data"]["timestamp"].as<unsigned long>();
+    
+    Serial.print("  Value:       ");
+    Serial.print(value);
+    
+    // แสดงหน่วยตามประเภทข้อมูล
+    if (deviceType == "bp" || deviceType == "bp2") {
+      Serial.println(" mmHg");
+    } else if (deviceType == "temp") {
+      Serial.println(" °C");
+    } else if (deviceType == "pulse") {
+      Serial.println(" bpm");
+    } else if (deviceType == "spo2") {
+      Serial.println(" %");
+    } else {
+      Serial.println();
+    }
+    
+    Serial.print("  Timestamp:   ");
+    Serial.println(timestamp);
   }
   
-  Serial.print("  Timestamp:   ");
-  Serial.println(timestamp);
   Serial.println("--- END PARSED DATA ---");
   
   // อัพเดทสถานะอุปกรณ์

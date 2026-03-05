@@ -1,7 +1,7 @@
-import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, Notification } from "electron";
 import path from "path";
 import { existsSync, readdirSync } from "fs";
-import { initConfigStore, getConfig, setConfig } from "./config/app-config";
+import { initConfigStore, getConfig, setConfig, type AppConfig } from "./config/app-config";
 import { resetSqliteDb } from "./database/sqlite";
 import { createMySqlPool } from "./database/mysql";
 // import { startBroker } from "./mqtt/broker";
@@ -15,6 +15,26 @@ import { rotateLogs } from "./logger/log-rotator";
 import { createStaticServer } from "./server/static-server";
 
 const isDev = !app.isPackaged;
+
+// ===== Single Instance Lock - ป้องกันการเปิดโปรแกรมซ้อน =====
+const gotTheLock = app.requestSingleInstanceLock();
+
+if (!gotTheLock) {
+  // มี instance อื่นทำงานอยู่แล้ว - ปิดตัวนี้
+  console.log("[APP] Another instance is already running. Quitting...");
+  app.quit();
+} else {
+  // รับการแจ้งเตือนเมื่อมีการพยายามเปิด instance ใหม่
+  app.on("second-instance", (event, commandLine, workingDirectory) => {
+    console.log("[APP] Second instance detected. Focusing main window...");
+    // Focus window ที่มีอยู่แล้ว
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+}
 
 // let stopBroker: (() => void) | null = null;
 // let brokerPort = 0;
@@ -31,6 +51,8 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let staticServer: { server: any; port: number; stop: () => void } | null = null;
+let sqlite: any = null;
+let lastNotificationTime: { [key: string]: number } = {};
 
 const getBaseUrl = () => {
   if (isDev) {
@@ -135,10 +157,119 @@ const emitToWindows = (channel: string, payload?: unknown) => {
   });
 };
 
+const showDataNotification = (idcard: string) => {
+  // Prevent duplicate notifications within 2 seconds for same idcard
+  const now = Date.now();
+  if (lastNotificationTime[idcard] && (now - lastNotificationTime[idcard]) < 2000) {
+    console.log(`[NOTIFICATION-SKIP] Skipping duplicate notification for ${idcard}`);
+    return;
+  }
+  lastNotificationTime[idcard] = now;
+
+  // Only show notification when window is minimized or hidden
+  if (mainWindow && mainWindow.isVisible() && !mainWindow.isMinimized()) {
+    console.log(`[NOTIFICATION-SKIP] Window is visible and not minimized`);
+    return;
+  }
+
+  if (!sqlite) {
+    console.log(`[NOTIFICATION-ERROR] SQLite not initialized`);
+    return;
+  }
+
+  try {
+    // Get current session data from active_sessions
+    const session = sqlite.prepare(
+      `SELECT idcard, pressure, pressure2, pulse, temperature, weight, height
+       FROM active_sessions
+       WHERE idcard = ?
+       LIMIT 1`
+    ).get(idcard);
+
+    if (!session) {
+      console.log(`[NOTIFICATION-ERROR] Session not found for ${idcard}`);
+      return;
+    }
+
+    const bodyLines: string[] = [];
+    
+    // Blood Pressure (combined format)
+    if (session.pressure) {
+      bodyLines.push(`🩺 Blood Pressure: ${session.pressure} mmHg`);
+    }
+    
+    if (session.pulse) {
+      bodyLines.push(`❤️  Pulse: ${session.pulse} bpm`);
+    }
+    
+    if (session.temperature) {
+      bodyLines.push(`🌡️  Temperature: ${session.temperature}°C`);
+    }
+    
+    if (session.weight) {
+      bodyLines.push(`⚖️  Weight: ${session.weight} kg`);
+    }
+    
+    if (session.height) {
+      bodyLines.push(`📏 Height: ${session.height} cm`);
+    }
+    
+    // Show ID card number
+    bodyLines.push(`🪪 ID Card: ${idcard}`);
+    
+    const body = bodyLines.join('\n');
+
+    console.log(`[NOTIFICATION] Creating notification for ${idcard}`);
+    console.log(`[NOTIFICATION] Body: ${body}`);
+    
+    // Get icon path for notification
+    let iconPath: string | undefined;
+    if (isDev) {
+      iconPath = path.join(__dirname, "..", "build", "icon.ico");
+    } else {
+      const resourceIcon = path.join(process.resourcesPath, "icon.ico");
+      iconPath = existsSync(resourceIcon) ? resourceIcon : path.join(__dirname, "..", "build", "icon.ico");
+    }
+    
+    const notification = new Notification({
+      title: "Medical Data Collector",
+      subtitle: "📊 Data Received",
+      body: body,
+      silent: false,
+      urgency: 'critical',
+      timeoutType: 'default',
+      icon: iconPath
+    });
+
+    notification.on('click', () => {
+      if (mainWindow) {
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+
+    notification.show();
+    console.log(`[NOTIFICATION] Notification sent for ${idcard}`);
+  } catch (error) {
+    console.error(`[NOTIFICATION-ERROR] Error:`, error);
+  }
+};
+
 const createWindow = () => {
+  // Get icon path
+  let iconPath: string;
+  if (isDev) {
+    iconPath = path.join(__dirname, "..", "build", "icon.ico");
+  } else {
+    const resourceIcon = path.join(process.resourcesPath, "icon.ico");
+    iconPath = existsSync(resourceIcon) ? resourceIcon : path.join(__dirname, "..", "build", "icon.ico");
+  }
+
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
+    icon: iconPath,
+    title: "Medical Data Collector",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -162,25 +293,71 @@ const createWindow = () => {
 
   mainWindow.loadURL(getBaseUrl());
   
-  if (isDev) {
-    mainWindow.webContents.openDevTools({ mode: "detach" });
-  }
+  // Developer Tools disabled for production use
+  // if (isDev) {
+  //   mainWindow.webContents.openDevTools({ mode: "detach" });
+  // }
+
+  // ส่ง serial status หลังจาก page โหลดเสร็จ เพื่อให้ renderer ได้รับ event แน่นอน
+  mainWindow.webContents.on("did-finish-load", () => {
+    if (mainWindow) {
+      mainWindow.webContents.send(IPC_EVENTS.SERIAL_STATUS, {
+        connected: serialPortInstance ? serialPortInstance.isConnected() : serialConnected,
+        portName: serialPortName
+      });
+      mainWindow.webContents.send(IPC_EVENTS.MYSQL_STATUS, {
+        connected: mysqlConnected
+      });
+    }
+  });
 
   ensureTray();
 
   mainWindow.on("minimize", () => {
+    console.log("[WINDOW] Window minimized");
     mainWindow?.hide();
   });
 
   mainWindow.on("close", (event: Electron.Event) => {
     if (!isQuitting) {
       event.preventDefault();
+      console.log("[WINDOW] Window hidden (close prevented)");
       mainWindow?.hide();
     }
   });
+  
+  // Test notification after window loads
+  setTimeout(() => {
+    console.log("[TEST] Sending test notification...");
+    try {
+      const testNotification = new Notification({
+        title: "Medical Data Collector",
+        body: "Notification system is ready! 🔔",
+        silent: false
+      });
+      testNotification.show();
+      console.log("[TEST] Test notification sent successfully");
+    } catch (error) {
+      console.error("[TEST] Failed to show test notification:", error);
+    }
+  }, 3000); // Show test notification 3 seconds after window opens
 };
 
+// Set application name for Windows notifications and taskbar
+app.setName("Medical Data Collector");
+
 app.whenReady().then(async () => {
+  // Request notification permission on Windows
+  if (process.platform === 'win32') {
+    const hasPermission = Notification.isSupported();
+    console.log(`[NOTIFICATION] Notification supported: ${hasPermission}`);
+    if (hasPermission) {
+      console.log(`[NOTIFICATION] Notifications are supported and ready`);
+    } else {
+      console.warn(`[NOTIFICATION-WARNING] Notifications are not supported on this system`);
+    }
+  }
+  
   const userDataPath = app.getPath("userData");
   initConfigStore(userDataPath);
   const config = getConfig();
@@ -217,7 +394,7 @@ app.whenReady().then(async () => {
     }
   }
   
-  let sqlite = resetSqliteDb(userDataPath);
+  sqlite = resetSqliteDb(userDataPath);
   let mysqlPool = createMySqlPool({
     host: config.database.host,
     port: config.database.port,
@@ -266,6 +443,7 @@ app.whenReady().then(async () => {
     serialPortInstance = startSerialPort({
       portName: config.serial.portName,
       baudRate: config.serial.baudRate,
+      writeLog: logger.write,
       onMessage: (params) => {
         processMqttMessage(
           {
@@ -275,7 +453,8 @@ app.whenReady().then(async () => {
             emit: (channel, payload) => {
               emitToWindows(channel, payload);
             },
-            getMySqlStatus: () => ({ connected: mysqlConnected })
+            getMySqlStatus: () => ({ connected: mysqlConnected }),
+            showNotification: showDataNotification
           },
           {
             topic: `medical/${params.deviceId}/${params.deviceType}`,
@@ -288,6 +467,7 @@ app.whenReady().then(async () => {
         });
       },
       onDevicesUpdated: (devices) => {
+        logger.write(formatLogLine("[SERIAL]", `Devices updated: ${devices.length} device(s) - ${devices.map(d => `${d.deviceId}:${d.online?'ON':'OFF'}`).join(', ')}`));
         emitToWindows(IPC_EVENTS.SERIAL_DEVICES_UPDATED, devices);
       },
       onStatusChanged: (status) => {
@@ -312,6 +492,79 @@ app.whenReady().then(async () => {
     });
   };
 
+  const restartSerialPort = async (serialConfig: AppConfig["serial"]) => {
+    logger.write(formatLogLine("[SERIAL-RESTART]", `Restarting serial port to ${serialConfig.portName || 'none'}...`));
+    
+    // Notify UI about restart
+    emitToWindows(IPC_EVENTS.SERIAL_STATUS, { connected: false, portName: serialPortName });
+    emitToWindows(IPC_EVENTS.SERIAL_DEVICES_UPDATED, []);
+    
+    // Disconnect existing instance
+    if (serialPortInstance) {
+      logger.write(formatLogLine("[SERIAL-RESTART]", "Disconnecting existing port..."));
+      try {
+        await serialPortInstance.disconnect();
+        logger.write(formatLogLine("[SERIAL-RESTART]", "Existing port disconnected successfully"));
+        // Wait for port to be fully released by OS
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : "Unknown error";
+        logger.write(formatLogLine("[SERIAL-RESTART]", `Error during disconnect: ${errMsg}`));
+      }
+      serialPortInstance = null;
+    }
+
+    // Clear states
+    serialConnected = false;
+    serialPortName = "";
+
+    // Only reconnect if port is configured
+    if (serialConfig.portName && serialConfig.portName.trim() !== "") {
+      logger.write(formatLogLine("[SERIAL-RESTART]", `Starting new connection to ${serialConfig.portName}...`));
+      serialPortInstance = startSerialPort({
+        portName: serialConfig.portName,
+        baudRate: serialConfig.baudRate,
+        writeLog: logger.write,
+        onMessage: (params) => {
+          processMqttMessage(
+            {
+              mysqlPool,
+              sqlite,
+              writeLog: logger.write,
+              emit: (channel, payload) => {
+                emitToWindows(channel, payload);
+              },
+              getMySqlStatus: () => ({ connected: mysqlConnected }),
+              showNotification: showDataNotification
+            },
+            {
+              topic: `medical/${params.deviceId}/${params.deviceType}`,
+              deviceType: params.deviceType,
+              message: params.message
+            }
+          ).catch((error) => {
+            const message = error instanceof Error ? error.message : "unknown_error";
+            logger.write(formatLogLine("[SERIAL]", `[ERROR] ${message}`));
+          });
+        },
+        onDevicesUpdated: (devices) => {
+          logger.write(formatLogLine("[SERIAL]", `Devices updated: ${devices.length} device(s) - ${devices.map(d => `${d.deviceId}:${d.online?'ON':'OFF'}`).join(', ')}`));
+          emitToWindows(IPC_EVENTS.SERIAL_DEVICES_UPDATED, devices);
+        },
+        onStatusChanged: (status) => {
+          serialConnected = status.connected;
+          serialPortName = status.portName;
+          emitToWindows(IPC_EVENTS.SERIAL_STATUS, status);
+        }
+      });
+      serialPortName = serialConfig.portName;
+    } else {
+      logger.write(formatLogLine("[SERIAL]", "Port not configured. Please set port in Settings."));
+      emitToWindows(IPC_EVENTS.SERIAL_STATUS, { connected: false, portName: "" });
+      emitToWindows(IPC_EVENTS.SERIAL_DEVICES_UPDATED, []);
+    }
+  };
+
   const ipcContext = {
     sqlite,
     getConfig,
@@ -326,9 +579,13 @@ app.whenReady().then(async () => {
         database: dbConfig.database
       });
     },
+    restartSerialPort,
     // getBrokerStatus: () => ({ running: brokerRunning, port: brokerPort }),
     // getBrokerClients: () => brokerInstance.getClients(),
-    getSerialStatus: () => ({ connected: serialConnected, portName: serialPortName }),
+    getSerialStatus: () => ({ 
+      connected: serialPortInstance ? serialPortInstance.isConnected() : serialConnected, 
+      portName: serialPortName 
+    }),
     getSerialDevices: () => serialPortInstance?.getDevices() || [],
     getMySqlStatus: () => ({ connected: mysqlConnected }),
     resetSqliteDb: () => {

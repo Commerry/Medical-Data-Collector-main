@@ -10,6 +10,7 @@ export type MessageContext = {
   writeLog: (message: string) => void;
   emit?: (channel: string, payload?: unknown) => void;
   getMySqlStatus?: () => { connected: boolean };
+  showNotification?: (idcard: string) => void;
 };
 
 type PendingMeasurementRow = {
@@ -518,68 +519,293 @@ const handleCombinedVitals = async (
   payload: any,
   idcardValue: string | null
 ) => {
+  ctx.writeLog(formatLogLine("[DEBUG]", `========== handleCombinedVitals START ==========`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `Payload received: ${JSON.stringify(payload)}`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `idcardValue: ${idcardValue ?? 'null'}`));
+  
+  // Log all available fields
+  ctx.writeLog(formatLogLine("[DEBUG]", `Available fields in payload:`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `  - weight: ${payload.weight ?? 'not present'}`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `  - height: ${payload.height ?? 'not present'}`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `  - bp: ${payload.bp ?? 'not present'}`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `  - bp2: ${payload.bp2 ?? 'not present'}`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `  - pressure: ${payload.pressure ?? 'not present'}`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `  - temp: ${payload.temp ?? 'not present'}`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `  - temperature: ${payload.temperature ?? 'not present'}`));
+  ctx.writeLog(formatLogLine("[DEBUG]", `  - pulse: ${payload.pulse ?? 'not present'}`));
+  
   const measurements: Array<{
-    deviceType: "weight" | "height" | "bp" | "temp" | "pulse";
+    deviceType: "weight" | "height" | "bp" | "bp2" | "temp" | "pulse";
     value: number | string | null;
   }> = [];
 
-  // Extract measurements from payload
-  if (payload.weight != null) measurements.push({ deviceType: "weight", value: payload.weight });
-  if (payload.height != null) measurements.push({ deviceType: "height", value: payload.height });
-  if (payload.bp != null) measurements.push({ deviceType: "bp", value: payload.bp });
+  // Extract measurements from payload (already flattened by processMqttMessage)
+  if (payload.weight != null) {
+    measurements.push({ deviceType: "weight", value: payload.weight });
+    ctx.writeLog(formatLogLine("[DEBUG]", `✅ Extracted weight: ${payload.weight}`));
+  } else {
+    ctx.writeLog(formatLogLine("[DEBUG]", `❌ Weight is null/undefined`));
+  }
+  if (payload.height != null) {
+    measurements.push({ deviceType: "height", value: payload.height });
+    ctx.writeLog(formatLogLine("[DEBUG]", `✅ Extracted height: ${payload.height}`));
+  } else {
+    ctx.writeLog(formatLogLine("[DEBUG]", `❌ Height is null/undefined`));
+  }
+  
+  // Combine bp and bp2 into a single "bp/bp2" format measurement
+  if (payload.bp != null && payload.bp2 != null) {
+    const combinedBP = `${payload.bp}/${payload.bp2}`;
+    measurements.push({ deviceType: "bp", value: combinedBP });
+    ctx.writeLog(formatLogLine("[DEBUG]", `Combined BP: ${combinedBP} from bp=${payload.bp}, bp2=${payload.bp2}`));
+  } else if (payload.bp != null) {
+    measurements.push({ deviceType: "bp", value: payload.bp });
+  } else if (payload.bp2 != null) {
+    measurements.push({ deviceType: "bp2", value: payload.bp2 });
+  }
+  
   if (payload.pressure != null) measurements.push({ deviceType: "bp", value: payload.pressure });
   if (payload.temp != null) measurements.push({ deviceType: "temp", value: payload.temp });
   if (payload.temperature != null) measurements.push({ deviceType: "temp", value: payload.temperature });
   if (payload.pulse != null) measurements.push({ deviceType: "pulse", value: payload.pulse });
 
+  ctx.writeLog(formatLogLine("[DEBUG]", `Extracted ${measurements.length} measurements: ${measurements.map(m => `${m.deviceType}=${m.value}`).join(', ')}`));
+  
   if (measurements.length === 0) {
     ctx.writeLog(formatLogLine("[MQTT]", "[WARNING] No vital measurements in payload"));
     return;
   }
 
-  // Check if session exists, if not create one automatically (for unified vitals)
+  // ===== กรณีมี ID Card (เครื่องที่ 1: BP Monitor) =====
   if (idcardValue) {
-    const existingSession = sqliteGet<{ id: number }>(
+    ctx.writeLog(formatLogLine("[DEBUG]", `========== RECEIVED ID CARD: ${idcardValue} ==========`));
+    
+    // ตรวจสอบ session ปัจจุบัน - ถ้ามี session เก่าที่ idcard ต่างกัน และยังไม่สมบูรณ์ (ไม่มีน้ำหนัก-ส่วนสูง) → ล้างทิ้ง
+    const existingSession = sqliteGet<{ 
+      id: number; 
+      idcard: string | null; 
+      weight: number | null; 
+      height: number | null;
+      is_temp?: number | null;
+    }>(
       ctx.sqlite,
-      "SELECT id FROM active_sessions WHERE idcard = ?",
-      [idcardValue]
+      `SELECT id, idcard, weight, height, is_temp 
+       FROM active_sessions 
+       WHERE (is_temp IS NULL OR is_temp = 0)
+       ORDER BY last_update DESC 
+       LIMIT 1`
+    );
+    
+    if (existingSession && existingSession.idcard && existingSession.idcard !== idcardValue) {
+      // มี session เก่าที่ idcard ต่างกัน
+      const hasWeight = existingSession.weight != null;
+      const hasHeight = existingSession.height != null;
+      
+      if (!hasWeight || !hasHeight) {
+        // Session เก่ายังไม่สมบูรณ์ (ไม่มีน้ำหนักหรือส่วนสูง) → ล้างทิ้ง
+        ctx.writeLog(
+          formatLogLine(
+            "[SESSION]", 
+            `[CLEAR] Clearing incomplete session ${existingSession.idcard} (weight=${hasWeight ? '✓' : '✗'}, height=${hasHeight ? '✓' : '✗'}) - New ID Card ${idcardValue} detected`
+          )
+        );
+        
+        sqliteRun(ctx.sqlite, "DELETE FROM active_sessions WHERE id = ?", [existingSession.id]);
+        sqliteRun(ctx.sqlite, "DELETE FROM pending_measurements WHERE idcard = ?", [existingSession.idcard]);
+        
+        ctx.emit?.("session:cleared", { 
+          idcard: existingSession.idcard,
+          reason: "incomplete_session_replaced"
+        });
+      } else {
+        ctx.writeLog(
+          formatLogLine(
+            "[SESSION]", 
+            `[KEEP] Previous session ${existingSession.idcard} is complete (weight=✓, height=✓) - Creating new session for ${idcardValue}`
+          )
+        );
+      }
+    }
+    
+    // บังคับ lookup ทุกครั้งเมื่อมี idcard เพื่อให้ PID/Visit No แสดงทันทีใน Active Session
+    if (ctx.getMySqlStatus && ctx.getMySqlStatus().connected) {
+      ctx.writeLog(formatLogLine("[DEBUG]", "MySQL is CONNECTED - proceeding with person/visit lookup"));
+      try {
+        ctx.writeLog(formatLogLine("[DEBUG]", `Calling handleCardReader for idcard: ${idcardValue}`));
+        const cardResult = await handleCardReader(ctx.mysqlPool, ctx.sqlite, {
+          idcard: idcardValue,
+          timestamp: payload.timestamp
+        });
+        ctx.writeLog(formatLogLine("[DEBUG]", `handleCardReader result: ok=${cardResult.ok}, person=${cardResult.person ? `PID=${cardResult.person.pid}` : 'null'}, visit=${cardResult.visit ? `visitno=${cardResult.visit.visitno}` : 'null'}, pendingVisit=${cardResult.pendingVisit}, reason=${cardResult.reason || 'none'}`));
+
+        if (cardResult.ok) {
+          if (cardResult.pendingVisit) {
+            ctx.writeLog(
+              formatLogLine(
+                "[SESSION]",
+                `[PENDING] IDCard=${idcardValue}, PID=${cardResult.person?.pid ?? "-"} (visit not found today)`
+              )
+            );
+          } else {
+            ctx.writeLog(
+              formatLogLine(
+                "[SESSION]",
+                `[RESOLVED] IDCard=${idcardValue}, PID=${cardResult.person?.pid ?? "-"}, VisitNo=${cardResult.visit?.visitno ?? "-"}, PCU=${cardResult.visit?.pcucode ?? "-"}`
+              )
+            );
+          }
+          ctx.emit?.("session:started", { idcard: idcardValue });
+          ctx.emit?.("session:updated", { idcard: idcardValue, field: "identity" });
+        } else {
+          ctx.writeLog(formatLogLine("[SESSION]", `[ERROR] Card reader failed: ${cardResult.reason}`));
+          upsertLocalSessionForIdcard(ctx, idcardValue);
+          ctx.emit?.("session:started", { idcard: idcardValue });
+        }
+      } catch (error) {
+        ctx.writeLog(formatLogLine("[SESSION]", `[ERROR] Card reader exception: ${error}`));
+        upsertLocalSessionForIdcard(ctx, idcardValue);
+        ctx.emit?.("session:started", { idcard: idcardValue });
+      }
+    } else {
+      // MySQL not connected, create local session
+      upsertLocalSessionForIdcard(ctx, idcardValue);
+      ctx.writeLog(formatLogLine("[SESSION]", `[LOCAL] Session created for ${idcardValue} (MySQL offline)`));
+      ctx.emit?.("session:started", { idcard: idcardValue });
+    }
+  }
+  // ===== กรณีไม่มี ID Card (เครื่องที่ 2: Scale - น้ำหนัก/ส่วนสูง) =====
+  // กฎ: น้ำหนัก-ส่วนสูงจะต้อง stamp ตาม ID Card ล่าสุดเท่านั้น
+  // ถ้าไม่เคยมี ID Card มาก่อน → ไม่บันทึก
+  // ถ้าเวลาเกิน 5 นาที → ไม่บันทึก (ไม่ทำตามขั้นตอน)
+  else {
+    ctx.writeLog(formatLogLine("[SESSION]", "[WEIGHT/HEIGHT] Received measurement without ID Card - looking for latest session"));
+    
+    const latestSession = sqliteGet<{ 
+      id: number; 
+      idcard: string | null; 
+      is_temp?: number | null;
+      last_update: string;
+    }>(
+      ctx.sqlite,
+      `SELECT id, idcard, is_temp, last_update
+       FROM active_sessions 
+       WHERE idcard IS NOT NULL AND idcard != '' AND (is_temp IS NULL OR is_temp = 0)
+       ORDER BY last_update DESC 
+       LIMIT 1`
     );
 
-    if (!existingSession) {
-      // Try to create session from MySQL if connected
-      if (ctx.getMySqlStatus && ctx.getMySqlStatus().connected) {
-        try {
-          const session = await ensureSessionForIdcard(ctx, idcardValue);
-          if (session) {
-            ctx.writeLog(formatLogLine("[SESSION]", `[AUTO-CREATED] Session for ${idcardValue}`));
-          } else {
-            // Person or visit not found, create local session
-            upsertLocalSessionForIdcard(ctx, idcardValue);
-            ctx.writeLog(formatLogLine("[SESSION]", `[LOCAL] Session created for ${idcardValue} (visit not found)`));
-          }
-        } catch (error) {
-          // Error creating session, create local session
-          upsertLocalSessionForIdcard(ctx, idcardValue);
-          ctx.writeLog(formatLogLine("[SESSION]", `[LOCAL] Session created for ${idcardValue} (error: ${error})`));
+    if (!latestSession || !latestSession.idcard) {
+      ctx.writeLog(
+        formatLogLine(
+          "[SESSION]", 
+          "[REJECTED] ❌ No active session with ID Card found - Weight/Height requires ID Card scan first"
+        )
+      );
+      ctx.emit?.("toast:show", {
+        variant: "destructive",
+        title: "❌ ID Card Required",
+        description: "Please scan ID Card before measuring weight/height"
+      });
+      return;
+    }
+
+    // ตรวจสอบ Timeout (5 นาที)
+    const lastUpdateTime = new Date(latestSession.last_update + ' UTC').getTime();
+    const currentTime = Date.now();
+    const timeDiffMinutes = (currentTime - lastUpdateTime) / (1000 * 60);
+    const TIMEOUT_MINUTES = 5;
+    
+    ctx.writeLog(
+      formatLogLine(
+        "[SESSION]", 
+        `[TIMEOUT-CHECK] Session ${latestSession.idcard} updated ${timeDiffMinutes.toFixed(2)} minutes ago (limit: ${TIMEOUT_MINUTES} min)`
+      )
+    );
+    
+    if (timeDiffMinutes > TIMEOUT_MINUTES) {
+      ctx.writeLog(
+        formatLogLine(
+          "[SESSION]", 
+          `[REJECTED] ⏱️ Session expired (${timeDiffMinutes.toFixed(2)} min > ${TIMEOUT_MINUTES} min) - Please scan ID Card again`
+        )
+      );
+      ctx.emit?.("toast:show", {
+        variant: "destructive",
+        title: "⏱️ Session Expired",
+        description: `Too late! Please scan ID Card again (${timeDiffMinutes.toFixed(1)} min exceeded)`
+      });
+      return;
+    }
+
+    // ใช้ idcard จาก session ล่าสุด
+    idcardValue = latestSession.idcard;
+    ctx.writeLog(
+      formatLogLine(
+        "[SESSION]", 
+        `[ACCEPTED] ✅ Using session ${idcardValue} (${timeDiffMinutes.toFixed(2)} min ago, within ${TIMEOUT_MINUTES} min limit) for weight/height measurement`
+      )
+    );
+  }
+
+  // ===== ตรวจจับและ resolve visitno ถ้ายังเป็น null (session ยังไม่ได้ query MySQL visit) =====
+  const currentSession = sqliteGet<{ id: number; visitno: number | null; pcucode: string | null; pid: number | null; pcucodeperson: string | null }>(
+    ctx.sqlite,
+    "SELECT id, visitno, pcucode, pid, pcucodeperson FROM active_sessions WHERE idcard = ?",
+    [idcardValue]
+  );
+
+  if (currentSession && (currentSession.visitno == null || currentSession.pcucode == null)) {
+    // Session มี idcard แต่ยัง parse ไม่มี visitno - ต้องหาจาก MySQL
+    if (ctx.getMySqlStatus && ctx.getMySqlStatus().connected && currentSession.pid && currentSession.pcucodeperson) {
+      try {
+        const visitRows = await mysqlQuery<VisitRecord[]>(
+          ctx.mysqlPool,
+          `SELECT pcucode, visitno, visitdate
+           FROM visit
+           WHERE pcucodeperson = ? AND pid = ? AND visitdate = CURDATE()
+           ORDER BY visitno DESC
+           LIMIT 1`,
+          [currentSession.pcucodeperson, currentSession.pid]
+        );
+
+        if (visitRows.length > 0) {
+          const visit = visitRows[0];
+          sqliteRun(
+            ctx.sqlite,
+            `UPDATE active_sessions
+             SET pcucode = ?, visitno = ?, visitdate = ?, last_update = datetime('now')
+             WHERE id = ?`,
+            [visit.pcucode, visit.visitno, toSqliteDate(visit.visitdate), currentSession.id]
+          );
+          ctx.writeLog(formatLogLine("[SESSION]", `[RESOLVED] Found visitno=${visit.visitno} for ${idcardValue}`));
+          ctx.emit?.("session:updated", { idcard: idcardValue, field: "visitno" });
+        } else {
+          ctx.writeLog(formatLogLine("[SESSION]", `[WARNING] No visit found today for ${idcardValue}`));
         }
-      } else {
-        // MySQL not connected, create local session
-        upsertLocalSessionForIdcard(ctx, idcardValue);
-        ctx.writeLog(formatLogLine("[SESSION]", `[LOCAL] Session created for ${idcardValue} (MySQL offline)`));
+      } catch (error) {
+        ctx.writeLog(formatLogLine("[SESSION]", `[ERROR] Failed to resolve visitno: ${error}`));
       }
-      
-      // Emit session started event
-      ctx.emit?.("session:started", { idcard: idcardValue });
     }
   }
 
   // Process each measurement
+  let updatedFields: string[] = [];
   for (const { deviceType, value } of measurements) {
+    ctx.writeLog(formatLogLine("[DEBUG]", `Processing measurement: deviceType=${deviceType}, value=${value}, idcard=${idcardValue || '(none)'}`));
+    ctx.writeLog(formatLogLine("[DEBUG]", `Current session in SQLite before processing:`));
+    try {
+      const currentSession = sqliteGet<any>(ctx.sqlite, 'SELECT * FROM active_sessions ORDER BY last_update DESC LIMIT 1');
+      ctx.writeLog(formatLogLine("[DEBUG]", `Active session: id=${currentSession?.id}, idcard=${currentSession?.idcard}, weight=${currentSession?.weight}, height=${currentSession?.height}, pressure=${currentSession?.pressure}`));
+    } catch (e) {
+      ctx.writeLog(formatLogLine("[DEBUG]", `Could not read current session: ${e}`));
+    }
     let result = await handleVitalSign(ctx.mysqlPool, ctx.sqlite, {
       idcard: idcardValue,
       deviceType,
       value
     });
+
+    ctx.writeLog(formatLogLine("[DEBUG]", `handleVitalSign result: ok=${result.ok}, fieldName=${result.fieldName}, reason=${result.reason}`));
 
     // If vitals arrive with an idcard but there is no session yet, auto-create it and retry once.
     if (!result.ok && result.reason === "session_not_found" && idcardValue) {
@@ -647,27 +873,93 @@ const handleCombinedVitals = async (
         errorMessage: "visit_not_found_today"
       });
       ctx.writeLog(
-        formatLogLine("[SESSION]", `[PENDING] visit not found today for ${idcardValue ?? "(temp)"}`)
+        formatLogLine("[SESSION]", `[PENDING] visit not found today for ${idcardValue ?? "(temp)"} - data saved to SQLite`)
       );
-      ctx.emit?.("session:updated", { idcard: idcardValue, field: result.fieldName });
-      ctx.emit?.("data:updated", { idcard: idcardValue, field: result.fieldName, value });
+      ctx.writeLog(
+        formatLogLine("[DEBUG]", `Emitting session:updated for field=${result.fieldName}, sessionId=${result.session.id}`)
+      );
+      ctx.emit?.("session:updated", { idcard: idcardValue || result.session.idcard, field: result.fieldName });
+      ctx.emit?.("data:updated", { idcard: idcardValue || result.session.idcard, field: result.fieldName, value });
+      updatedFields.push(result.fieldName);
       continue;
     }
 
     try {
       let mysqlFieldName = result.fieldName;
-      if (deviceType === "bp") {
+      // For BP measurements, check if we should stamp to pressure or pressure2
+      if (deviceType === "bp" || deviceType === "bp2") {
         mysqlFieldName = await resolveBpMySqlField(ctx.mysqlPool, {
           pcucode: result.session.pcucode,
           visitno: result.session.visitno
         });
       }
-      await mysqlQuery(
+      
+      // For BP measurements, read the combined value from SQLite (set by handleVitalSign)
+      let stampValue = value;
+      if (deviceType === "bp" || deviceType === "bp2") {
+        const session = sqliteGet<{ pressure: string | null }>(
+          ctx.sqlite,
+          "SELECT pressure FROM active_sessions WHERE id = ?",
+          [result.session.id]
+        );
+        if (session?.pressure) {
+          stampValue = session.pressure;
+          ctx.writeLog(formatLogLine("[DEBUG]", `Using combined BP value: ${stampValue} (original: ${value})`));
+        }
+      }
+      
+      ctx.writeLog(
+        formatLogLine(
+          "[MYSQL]",
+          `[STAMP-ATTEMPT] Updating visit table: pcucode=${result.session.pcucode}, visitno=${result.session.visitno}, field=${mysqlFieldName}, value=${stampValue}, idcard=${idcardValue ?? ""}`
+        )
+      );
+      const updateResult = await mysqlQuery<{ affectedRows?: number }>(
         ctx.mysqlPool,
         `UPDATE visit SET ${mysqlFieldName} = ?, dateupdate = NOW()
          WHERE pcucode = ? AND visitno = ? AND visitdate = CURDATE()`,
-        [value, result.session.pcucode, result.session.visitno]
+        [stampValue, result.session.pcucode, result.session.visitno]
       );
+      ctx.writeLog(
+        formatLogLine(
+          "[MYSQL]",
+          `[STAMP-RESULT] affectedRows=${updateResult?.affectedRows ?? 0}`
+        )
+      );
+
+      if (!updateResult || !updateResult.affectedRows) {
+        const reason = "visit_row_not_matched";
+        enqueuePendingMeasurement(ctx, {
+          idcard: idcardValue ?? "",
+          deviceType,
+          value: stampValue ?? null,
+          measuredAt: payload.timestamp,
+          errorMessage: reason
+        });
+        logSyncHistory(ctx.sqlite, {
+          sessionId: result.session.id,
+          idcard: idcardValue ?? "",
+          visitno: result.session.visitno,
+          fieldsUpdated: [mysqlFieldName],
+          status: "replay_pending",
+          errorMessage: reason
+        });
+        
+        // Show error toast for failed stamp
+        ctx.emit?.("toast:show", {
+          variant: "destructive",
+          title: "⚠️ Sync Failed",
+          description: `Could not save ${mysqlFieldName} - will retry later`
+        });
+        
+        ctx.writeLog(
+          formatLogLine(
+            "[MYSQL]",
+            `[STAMP-SKIP] No row updated (idcard=${idcardValue ?? ""}, pcucode=${result.session.pcucode}, visitno=${result.session.visitno}, field=${mysqlFieldName}, value=${stampValue})`
+          )
+        );
+        continue;
+      }
 
       logSyncHistory(ctx.sqlite, {
         sessionId: result.session.id,
@@ -676,23 +968,33 @@ const handleCombinedVitals = async (
         fieldsUpdated: [mysqlFieldName],
         status: "success"
       });
+      
+      // Show success toast for MySQL stamp
+      ctx.emit?.("toast:show", {
+        variant: "success",
+        title: "✅ Data Synced",
+        description: `${mysqlFieldName} saved to database`
+      });
 
-      // Update SQLite active_sessions for Frontend display using session ID
-      sqliteRun(
-        ctx.sqlite,
-        `UPDATE active_sessions
-         SET ${result.fieldName} = ?, last_update = datetime('now')
-         WHERE id = ?`,
-        [value, result.session.id]
-      );
+      // For BP, handleVitalSign already updated SQLite with combined value - don't overwrite it
+      // For other measurements, update SQLite
+      if (deviceType !== "bp" && deviceType !== "bp2") {
+        sqliteRun(
+          ctx.sqlite,
+          `UPDATE active_sessions
+           SET ${result.fieldName} = ?, last_update = datetime('now')
+           WHERE id = ?`,
+          [value, result.session.id]
+        );
+      }
 
-      ctx.writeLog(formatLogLine("[MQTT]", `[UPDATED] ${result.fieldName}=${value}`));
-      ctx.emit?.("session:updated", { idcard: idcardValue, field: result.fieldName });
-      ctx.emit?.("data:updated", { idcard: idcardValue, field: result.fieldName, value });
+      ctx.writeLog(formatLogLine("[MQTT]", `[UPDATED] ${result.fieldName}=${stampValue} for session_id=${result.session.id}, idcard=${idcardValue ?? 'none'}`));
+      updatedFields.push(result.fieldName);
+      ctx.writeLog(formatLogLine("[EVENT]", `Field ${result.fieldName} updated successfully`));
     } catch (error) {
       const messageText = error instanceof Error ? error.message : "unknown_error";
       let mysqlFieldName = result.fieldName;
-      if (deviceType === "bp" && result.session.pcucode && result.session.visitno != null) {
+      if ((deviceType === "bp" || deviceType === "bp2") && result.session.pcucode && result.session.visitno != null) {
         mysqlFieldName = await resolveBpMySqlField(ctx.mysqlPool, {
           pcucode: result.session.pcucode,
           visitno: result.session.visitno
@@ -713,9 +1015,37 @@ const handleCombinedVitals = async (
         status: "replay_pending",
         errorMessage: messageText
       });
-      ctx.writeLog(formatLogLine("[MYSQL]", `[ERROR] ${messageText}`));
+      ctx.writeLog(
+        formatLogLine(
+          "[MYSQL]",
+          `[ERROR] Stamp failed (idcard=${idcardValue ?? ""}, pcucode=${result.session.pcucode}, visitno=${result.session.visitno}, field=${mysqlFieldName}, value=${value}) reason=${messageText}`
+        )
+      );
     }
   }
+  
+  // Emit events once after all measurements processed
+  if (updatedFields.length > 0) {
+    ctx.writeLog(formatLogLine("[EVENT]", `Emitting session:updated and data:updated for ${updatedFields.length} field(s): ${updatedFields.join(', ')}`));
+    ctx.emit?.("session:updated", { idcard: idcardValue, fields: updatedFields });
+    ctx.emit?.("data:updated", { idcard: idcardValue, fields: updatedFields });
+    
+    // Show toast notification for data update
+    ctx.emit?.("toast:show", {
+      variant: "default",
+      title: "📊 Data Updated",
+      description: `Updated: ${updatedFields.join(', ')} for ${idcardValue || 'session'}`
+    });
+    
+    // Show notification if idcard is available
+    if (idcardValue && ctx.showNotification) {
+      ctx.showNotification(idcardValue);
+    }
+  } else {
+    ctx.writeLog(formatLogLine("[EVENT]", `No fields were successfully updated`));
+  }
+  
+  ctx.writeLog(formatLogLine("[DEBUG]", `========== handleCombinedVitals END ==========`));
 };
 
 export const processMqttMessage = async (
@@ -723,9 +1053,21 @@ export const processMqttMessage = async (
   params: { topic: string; deviceType: string; message: string }
 ) => {
   const { topic, deviceType, message } = params;
+  
+  ctx.writeLog(formatLogLine("[MQTT-RECEIVE]", `========================================`));
+  ctx.writeLog(formatLogLine("[MQTT-RECEIVE]", `Topic: ${topic}`));
+  ctx.writeLog(formatLogLine("[MQTT-RECEIVE]", `DeviceType: ${deviceType}`));
+  ctx.writeLog(formatLogLine("[MQTT-RECEIVE]", `Message: ${message}`));
+  ctx.writeLog(formatLogLine("[MQTT-RECEIVE]", `Message Length: ${message.length} chars`));
+  
   let payload: any;
   try {
     payload = JSON.parse(message);
+    ctx.writeLog(formatLogLine("[MQTT-RECEIVE]", `Payload Keys: ${Object.keys(payload).join(', ')}`));
+    if (payload.data) {
+      ctx.writeLog(formatLogLine("[MQTT-RECEIVE]", `Payload.data Keys: ${Object.keys(payload.data).join(', ')}`));
+      ctx.writeLog(formatLogLine("[MQTT-RECEIVE]", `Payload.data: ${JSON.stringify(payload.data)}`));
+    }
   } catch (error) {
     logMqttMessage(ctx.sqlite, {
       topic,
@@ -760,10 +1102,28 @@ export const processMqttMessage = async (
     return trimmed.toUpperCase();
   };
 
-  // Handle new combined vitals topic
-  if (deviceType === "vitals") {
-    const idcardValue = normalizeIdcard(payload.idcard) || null;
-    await handleCombinedVitals(ctx, payload, idcardValue);
+  // Extract vitals data from nested structure if present
+  let vitalsPayload = payload;
+  if (payload.data && typeof payload.data === 'object') {
+    ctx.writeLog(formatLogLine("[MQTT-EXTRACT]", `Found nested data object, extracting vitals...`));
+    ctx.writeLog(formatLogLine("[MQTT-EXTRACT]", `Nested data keys: ${Object.keys(payload.data).join(', ')}`));
+    // Merge data from nested 'data' object to root level
+    vitalsPayload = {
+      ...payload,
+      ...payload.data,
+      idcard: payload.idcard || payload.data.idcard
+    };
+    ctx.writeLog(formatLogLine("[MQTT-EXTRACT]", `Merged payload keys: ${Object.keys(vitalsPayload).join(', ')}`));
+    ctx.writeLog(formatLogLine("[MQTT-EXTRACT]", `Weight: ${vitalsPayload.weight}, Height: ${vitalsPayload.height}`));
+  }
+
+  // Handle combined vitals topic (vitals, blood_pressure, weight_height, etc.)
+  if (deviceType === "vitals" || deviceType === "blood_pressure" || deviceType === "weight_height") {
+    ctx.writeLog(formatLogLine("[MQTT-ROUTE]", `✅ Routing to handleCombinedVitals for deviceType: ${deviceType}`));
+    const idcardValue = normalizeIdcard(vitalsPayload.idcard) || null;
+    ctx.writeLog(formatLogLine("[MQTT-ROUTE]", `Extracted idcard: ${idcardValue ?? '(null - no ID card)'}`));
+    ctx.writeLog(formatLogLine("[MQTT-ROUTE]", `Payload to handleCombinedVitals: ${JSON.stringify(vitalsPayload)}`));
+    await handleCombinedVitals(ctx, vitalsPayload, idcardValue);
     return;
   }
 
@@ -852,7 +1212,10 @@ export const processMqttMessage = async (
           [idcardValue]
         );
         ctx.writeLog(
-          formatLogLine("[SESSION]", `[STARTED] IDCard: ${idcardValue}`)
+          formatLogLine(
+            "[SESSION]",
+            `[STARTED] IDCard=${idcardValue}, PID=${result.person?.pid ?? "-"}, VisitNo=${result.visit?.visitno ?? "-"}, PCU=${result.visit?.pcucode ?? "-"}`
+          )
         );
         sqliteRun(
           ctx.sqlite,
@@ -951,18 +1314,56 @@ export const processMqttMessage = async (
 
   try {
     let mysqlFieldName = result.fieldName;
-    if (deviceTypeMap === "bp") {
+    if (deviceTypeMap === "bp" || deviceTypeMap === "bp2") {
       mysqlFieldName = await resolveBpMySqlField(ctx.mysqlPool, {
         pcucode: result.session.pcucode,
         visitno: result.session.visitno
       });
     }
-    await mysqlQuery(
+    ctx.writeLog(
+      formatLogLine(
+        "[MYSQL]",
+        `[STAMP-ATTEMPT] Updating visit table: pcucode=${result.session.pcucode}, visitno=${result.session.visitno}, field=${mysqlFieldName}, value=${value}, idcard=${idcardValue ?? ""}`
+      )
+    );
+    const updateResult = await mysqlQuery<{ affectedRows?: number }>(
       ctx.mysqlPool,
       `UPDATE visit SET ${mysqlFieldName} = ?, dateupdate = NOW()
        WHERE pcucode = ? AND visitno = ? AND visitdate = CURDATE()`,
       [value, result.session.pcucode, result.session.visitno]
     );
+    ctx.writeLog(
+      formatLogLine(
+        "[MYSQL]",
+        `[STAMP-RESULT] affectedRows=${updateResult?.affectedRows ?? 0}`
+      )
+    );
+
+    if (!updateResult || !updateResult.affectedRows) {
+      const reason = "visit_row_not_matched";
+      enqueuePendingMeasurement(ctx, {
+        idcard: idcardValue ?? "",
+        deviceType: deviceTypeMap,
+        value: value ?? null,
+        measuredAt: payload.timestamp,
+        errorMessage: reason
+      });
+      logSyncHistory(ctx.sqlite, {
+        sessionId: result.session.id,
+        idcard: idcardValue ?? "",
+        visitno: result.session.visitno,
+        fieldsUpdated: [mysqlFieldName],
+        status: "replay_pending",
+        errorMessage: reason
+      });
+      ctx.writeLog(
+        formatLogLine(
+          "[MYSQL]",
+          `[STAMP-SKIP] No row updated (idcard=${idcardValue ?? ""}, pcucode=${result.session.pcucode}, visitno=${result.session.visitno}, field=${mysqlFieldName}, value=${value})`
+        )
+      );
+      return;
+    }
 
     logSyncHistory(ctx.sqlite, {
       sessionId: result.session.id,
@@ -973,14 +1374,17 @@ export const processMqttMessage = async (
     });
 
     ctx.writeLog(
-      formatLogLine("[MQTT]", `[UPDATED] ${result.fieldName}=${value}`)
+      formatLogLine(
+        "[MQTT]",
+        `[UPDATED] ${result.fieldName}=${value} (pcucode=${result.session.pcucode}, visitno=${result.session.visitno})`
+      )
     );
     ctx.emit?.("session:updated", { idcard: idcardValue, field: result.fieldName });
     ctx.emit?.("data:updated", { idcard: idcardValue, field: result.fieldName, value });
   } catch (error) {
     const messageText = error instanceof Error ? error.message : "unknown_error";
     let mysqlFieldName = result.fieldName;
-    if (deviceTypeMap === "bp" && result.session.pcucode && result.session.visitno != null) {
+    if ((deviceTypeMap === "bp" || deviceTypeMap === "bp2") && result.session.pcucode && result.session.visitno != null) {
       mysqlFieldName = await resolveBpMySqlField(ctx.mysqlPool, {
         pcucode: result.session.pcucode,
         visitno: result.session.visitno
@@ -1001,6 +1405,11 @@ export const processMqttMessage = async (
       status: "replay_pending",
       errorMessage: messageText
     });
-    ctx.writeLog(formatLogLine("[MYSQL]", `[ERROR] ${messageText}`));
+    ctx.writeLog(
+      formatLogLine(
+        "[MYSQL]",
+        `[ERROR] Stamp failed (idcard=${idcardValue ?? ""}, pcucode=${result.session.pcucode}, visitno=${result.session.visitno}, field=${mysqlFieldName}, value=${value}) reason=${messageText}`
+      )
+    );
   }
 };

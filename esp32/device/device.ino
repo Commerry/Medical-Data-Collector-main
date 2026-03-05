@@ -127,7 +127,7 @@ void loop() {
       Serial.println("╚════════════════════════════════════════╝");
       
       // สร้าง ID Card ใหม่
-      currentIdCard = "1234567890123";
+      currentIdCard = "7012345678901";  // ใช้ ID Card ที่มีใน person table (PID=30001)
       Serial.print("📇 ID Card: ");
       Serial.println(currentIdCard);
       Serial.println();
@@ -142,14 +142,9 @@ void loop() {
       Serial.print("   Systolic:  ");
       Serial.print(bpSystolic);
       Serial.println(" mmHg");
-      sendVitalsData(currentIdCard.c_str(), "bp", bpSystolic);
-      delay(200);
-      
       Serial.print("   Diastolic: ");
       Serial.print(bpDiastolic);
       Serial.println(" mmHg");
-      sendVitalsData(currentIdCard.c_str(), "bp2", bpDiastolic);
-      delay(200);
       
       // 2. Pulse Rate
       int pulse = 75 + random(-15, 15);  // 60-90 bpm
@@ -159,7 +154,9 @@ void loop() {
       Serial.print("   Pulse: ");
       Serial.print(pulse);
       Serial.println(" bpm");
-      sendVitalsData(currentIdCard.c_str(), "pulse", pulse);
+      
+      // ===== ส่งข้อมูลชุดที่ 1 (BP Monitor) รวมกัน =====
+      sendBatchVitalsData(currentIdCard.c_str(), bpSystolic, bpDiastolic, pulse);
       
       Serial.println();
       Serial.println("✅ เครื่องที่ 1 ส่งข้อมูลเรียบร้อย");
@@ -186,8 +183,6 @@ void loop() {
       Serial.print("   Weight: ");
       Serial.print(weight);
       Serial.println(" kg");
-      sendVitalsData(currentIdCard.c_str(), "weight", weight);
-      delay(200);
       
       // 2. Height (ส่วนสูง)
       float height = 165.0 + random(-150, 150) / 10.0;  // 150.0-180.0 cm
@@ -197,8 +192,6 @@ void loop() {
       Serial.print("   Height: ");
       Serial.print(height);
       Serial.println(" cm");
-      sendVitalsData(currentIdCard.c_str(), "height", height);
-      delay(200);
       
       // 3. Temperature (อุณหภูมิร่างกาย)
       float temperature = 36.5 + random(-5, 10) / 10.0;  // 36.0-37.5 °C
@@ -208,7 +201,9 @@ void loop() {
       Serial.print("   Temperature: ");
       Serial.print(temperature);
       Serial.println(" °C");
-      sendVitalsData(currentIdCard.c_str(), "temp", temperature);
+      
+      // ===== ส่งข้อมูลชุดที่ 2 (Scale) รวมกัน (ไม่ส่ง ID Card) =====
+      sendScaleVitalsData(weight, height, temperature);
       
       Serial.println();
       Serial.println("✅ เครื่องที่ 2 ส่งข้อมูลเรียบร้อย");
@@ -492,6 +487,80 @@ void sendVitalsData(const char* idcard, const char* deviceType, float value) {
   }
 }
 
+// ===== SEND BATCH VITALS DATA (BP Monitor) =====
+// ส่งข้อมูลชุดที่ 1: ID Card + BP + Pulse รวมกัน
+void sendBatchVitalsData(const char* idcard, int bpSystolic, int bpDiastolic, int pulse) {
+  if (!wifiConnected) return;
+  
+  #ifdef ESP32
+    StaticJsonDocument<512> doc;
+  #else
+    StaticJsonDocument<256> doc;
+  #endif
+  
+  doc["type"] = "vitals";
+  doc["deviceId"] = DEVICE_ID;
+  doc["deviceName"] = DEVICE_NAME;
+  doc["macAddress"] = macAddress;
+  doc["deviceType"] = "combined";  // รวมหลาย field
+  doc["idcard"] = idcard;  // มี ID Card
+  
+  // สร้าง nested object สำหรับ vital signs
+  doc["bp"] = bpSystolic;
+  doc["bp2"] = bpDiastolic;
+  doc["pulse"] = pulse;
+  doc["timestamp"] = millis();
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  Serial.println("\n--- Sending BP Monitor Batch ---");
+  Serial.println(jsonString);
+  
+  if (sendHTTPPost("/api/vitals", jsonString)) {
+    Serial.println("✅ BP Monitor batch sent successfully");
+  } else {
+    Serial.println("✗ Failed to send BP Monitor batch");
+  }
+}
+
+// ===== SEND SCALE VITALS DATA (Scale) =====
+// ส่งข้อมูลชุดที่ 2: Weight + Height + Temp รวมกัน (ไม่ส่ง ID Card)
+void sendScaleVitalsData(float weight, float height, float temperature) {
+  if (!wifiConnected) return;
+  
+  #ifdef ESP32
+    StaticJsonDocument<512> doc;
+  #else
+    StaticJsonDocument<256> doc;
+  #endif
+  
+  doc["type"] = "vitals";
+  doc["deviceId"] = DEVICE_ID;
+  doc["deviceName"] = DEVICE_NAME;
+  doc["macAddress"] = macAddress;
+  doc["deviceType"] = "combined";  // รวมหลาย field
+  // ไม่ส่ง idcard - จะใช้ session เดิม
+  
+  // สร้าง nested object สำหรับ vital signs
+  doc["weight"] = weight;
+  doc["height"] = height;
+  doc["temp"] = temperature;
+  doc["timestamp"] = millis();
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  Serial.println("\n--- Sending Scale Batch ---");
+  Serial.println(jsonString);
+  
+  if (sendHTTPPost("/api/vitals", jsonString)) {
+    Serial.println("✅ Scale batch sent successfully");
+  } else {
+    Serial.println("✗ Failed to send Scale batch");
+  }
+}
+
 // ===== SETUP LED =====
 void setupLED() {
   pinMode(GREEN_LED_PIN, OUTPUT);
@@ -508,57 +577,6 @@ void setupLED() {
     Serial.print("  Green LED: GPIO");
     Serial.println(GREEN_LED_PIN);
   #endif
-}
-
-// ===== UPDATE LED =====
-void updateLED() {
-  if (!wifiConnected) {
-    // ไม่ได้เชื่อมต่อ - ดับ LED
-    digitalWrite(GREEN_LED_PIN, LOW);
-    return;
-  }
-  
-  // เชื่อมต่อแล้ว - กระพริบทุก 1 วิ ดับ 5 วิ
-  unsigned long now = millis();
-  unsigned long interval = 6000;  // 1วิ + 5วิ = 6 วินาที
-  unsigned long elapsed = now - lastLedBlink;
-  
-  if (elapsed < 1000) {
-    // 1 วินาทีแรก - ติด
-    digitalWrite(GREEN_LED_PIN, HIGH);
-  } else if (elapsed >= interval) {
-    // ครบ 6 วินาทีแล้ว - รีเซ็ต
-    lastLedBlink = now;
-  } else {
-    // ดับอยู่ 5 วินาที
-    digitalWrite(GREEN_LED_PIN, LOW);
-  }
-}
-
-// ===== BLINK LED ONCE =====
-void blinkLEDOnce() {
-  // กระพริบสั้นๆ 1 ชุด (3 ครั้งเร็ว)
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(GREEN_LED_PIN, HIGH);
-    delay(100);
-    digitalWrite(GREEN_LED_PIN, LOW);
-    delay(100);
-  }
-  // รีเซ็ตตัวจับเวลาสำหรับการกระพริบปกติ
-  lastLedBlink = millis();
-}
-
-// ===== SETUP LED =====
-void setupLED() {
-  pinMode(GREEN_LED_PIN, OUTPUT);
-  
-  // ทดสอบตอนเริ่มต้น: ติดแล้วดับ
-  digitalWrite(GREEN_LED_PIN, HIGH);
-  delay(500);
-  digitalWrite(GREEN_LED_PIN, LOW);
-  
-  Serial.println("✓ LED initialized");
-  Serial.printf("  Green LED: GPIO%d\n", GREEN_LED_PIN);
 }
 
 // ===== UPDATE LED =====

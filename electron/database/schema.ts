@@ -56,6 +56,7 @@ export const sqliteSchemaStatements = [
     weight REAL,
     height REAL,
     pressure TEXT,
+    pressure2 TEXT,
     temperature REAL,
     pulse INTEGER,
     session_start DATETIME DEFAULT CURRENT_TIMESTAMP,

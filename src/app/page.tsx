@@ -6,6 +6,7 @@ import { useHistory } from "@/lib/hooks/use-history";
 import { useSerialDevices } from "@/lib/hooks/use-serial-devices";
 import { useSerialStatus } from "@/lib/hooks/use-serial-status";
 import { useMySqlStatus } from "@/lib/hooks/use-mysql-status";
+import { useDataUpdateToasts } from "@/lib/hooks/use-data-update-toasts";
 import { ActiveSessionCard } from "@/components/dashboard/active-session-card";
 import { DashboardHeader } from "@/components/dashboard/dashboard-header";
 import { SerialDevicesModal } from "@/components/dashboard/serial-devices-modal";
@@ -19,6 +20,9 @@ export default function DashboardPage() {
   const serialStatus = useSerialStatus();
   const mysqlStatus = useMySqlStatus();
   const [devicesOpen, setDevicesOpen] = useState(false);
+  
+  // Initialize toast notifications
+  useDataUpdateToasts();
 
   return (
     <section className="space-y-6">

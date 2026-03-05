@@ -16,6 +16,10 @@ export type AppConfig = {
     username: string;
     password: string;
   };
+  serial: {
+    portName: string;
+    baudRate: number;
+  };
   app: {
     pcucode: string;
     sessionTimeoutMinutes: number;

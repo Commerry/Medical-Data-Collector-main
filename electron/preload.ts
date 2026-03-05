@@ -12,6 +12,7 @@ const allowedChannels = [
   "serial:get-status",
   "serial:get-devices",
   "serial:get-ports",
+  "serial:test-device",
   "session:get-active",
   "session:get-all",
   "history:get-visits",
@@ -23,10 +24,13 @@ const allowedEvents = [
   "session:started",
   "session:updated",
   "data:updated",
+  "visit:found",
   "mysql:status",
   // "mqtt:clients-updated"
   "serial:devices-updated",
-  "serial:status"
+  "serial:status",
+  "serial:device-test-result",
+  "toast:show"
 ];
 
 contextBridge.exposeInMainWorld("mdc", {

@@ -15,11 +15,12 @@ export type SerialPortOptions = {
   onMessage?: (payload: { deviceId: string; deviceType: string; message: string }) => void;
   onDevicesUpdated?: (devices: SerialDevice[]) => void;
   onStatusChanged?: (status: { connected: boolean; portName: string }) => void;
+  writeLog?: (message: string) => void;
 };
 
 export type SerialPortInstance = {
   port: SerialPort;
-  isConnected: boolean;
+  isConnected: () => boolean;
   getDevices: () => SerialDevice[];
   disconnect: () => void;
 };
@@ -32,7 +33,8 @@ export const startSerialPort = ({
   baudRate,
   onMessage,
   onDevicesUpdated,
-  onStatusChanged
+  onStatusChanged,
+  writeLog
 }: SerialPortOptions): SerialPortInstance => {
   let isConnected = false;
   let port: SerialPort | null = null;
@@ -47,9 +49,11 @@ export const startSerialPort = ({
   const updateDevice = (deviceId: string, deviceName: string, macAddress: string) => {
     const existing = devices.get(deviceId);
     if (existing) {
+      writeLog?.(`[SERIAL-DEVICE] Updated: ${deviceId} (${deviceName})`);
       existing.lastSeen = new Date();
       existing.online = true;
     } else {
+      writeLog?.(`[SERIAL-DEVICE] New device: ${deviceId} (${deviceName}) MAC: ${macAddress}`);
       devices.set(deviceId, {
         deviceId,
         deviceName,
@@ -58,21 +62,37 @@ export const startSerialPort = ({
         online: true
       });
     }
+    writeLog?.(`[SERIAL-DEVICE] Total devices: ${devices.size}`);
     emitDevicesUpdated();
   };
 
   const checkDeviceTimeout = () => {
     const now = Date.now();
     let changed = false;
-    devices.forEach((device) => {
-      if (now - device.lastSeen.getTime() > DEVICE_TIMEOUT_MS) {
+    const devicesToRemove: string[] = [];
+    
+    devices.forEach((device, deviceId) => {
+      const timeSinceLastSeen = now - device.lastSeen.getTime();
+      
+      // If device hasn't been seen for DEVICE_TIMEOUT_MS, mark for removal
+      if (timeSinceLastSeen > DEVICE_TIMEOUT_MS) {
         if (device.online) {
-          device.online = false;
-          changed = true;
+          writeLog?.(`[SERIAL-TIMEOUT] Device ${deviceId} timed out (${Math.floor(timeSinceLastSeen / 1000)}s since last seen)`);
         }
+        // Remove device after timeout
+        devicesToRemove.push(deviceId);
+        changed = true;
       }
     });
+    
+    // Remove timed out devices from map
+    devicesToRemove.forEach(deviceId => {
+      devices.delete(deviceId);
+      writeLog?.(`[SERIAL-TIMEOUT] Removed device ${deviceId} from active list`);
+    });
+    
     if (changed) {
+      writeLog?.(`[SERIAL-TIMEOUT] Active devices: ${devices.size}`);
       emitDevicesUpdated();
     }
   };
@@ -106,7 +126,7 @@ export const startSerialPort = ({
         }
 
         isConnected = true;
-        console.log(`[SERIAL] Connected to ${portName} at ${baudRate} baud`);
+        writeLog?.(`[SERIAL] Connected to ${portName} at ${baudRate} baud`);
         onStatusChanged?.({ connected: true, portName });
 
         // Start device timeout checker - ตรวจสอบทุก 3 วินาที (เรียลไทม์)
@@ -114,19 +134,45 @@ export const startSerialPort = ({
       });
 
       parser.on("data", (line: string) => {
-        // Filter เฉพาะบรรทัดที่เป็น JSON data (ขึ้นต้นด้วย [DATA])
         const trimmedLine = line.trim();
         
         // Skip empty lines
         if (!trimmedLine) return;
         
-        // ตรวจสอบว่าเป็นบรรทัด [DATA] หรือไม่
+        // Log ทุกบรรทัดที่รับมา (DEBUG)
+        writeLog?.(`[SERIAL-RAW] ${trimmedLine}`);
+        
+        // ========== PARSE DEBUG MESSAGES ==========
+        // Pattern: "Station X: MAC_ADDRESS"
+        const stationMatch = trimmedLine.match(/Station\s+(\d+):\s+([0-9A-Fa-f:]{17})/);
+        if (stationMatch) {
+          const stationNum = stationMatch[1];
+          const macAddress = stationMatch[2].toUpperCase();
+          const deviceId = `DEVICE_${stationNum.padStart(3, '0')}`;
+          const deviceName = `Device ${stationNum}`;
+          
+          writeLog?.(`[SERIAL-PARSE] Detected device from Station line: ${deviceId} MAC: ${macAddress}`);
+          updateDevice(deviceId, deviceName, macAddress);
+          return; // ไม่ต้อง process ต่อ
+        }
+        
+        // Pattern: "Method X - ... Y stations" หรือ "softAPgetStationNum(): Y"
+        const countMatch = trimmedLine.match(/(?:(\d+)\s+stations?|softAPgetStationNum\(\):\s*(\d+))/i);
+        if (countMatch) {
+          const count = parseInt(countMatch[1] || countMatch[2]);
+          writeLog?.(`[SERIAL-PARSE] Detected ${count} stations`);
+          // อาจจะเคลียร์ offline devices ที่เกินจำนวนนี้ในอนาคต
+          return;
+        }
+        
+        // ========== PARSE JSON MESSAGES ==========
         let jsonString = trimmedLine;
         if (trimmedLine.startsWith("[DATA]")) {
-          // ตัด prefix [DATA] ออก
           jsonString = trimmedLine.substring(6).trim();
+        } else if (trimmedLine.startsWith("{") && trimmedLine.endsWith("}")) {
+          jsonString = trimmedLine;
         } else {
-          // ถ้าไม่มี [DATA] prefix ให้ skip (เป็น debug message)
+          // ไม่ใช่ทั้ง Station pattern และ JSON - skip
           return;
         }
         
@@ -140,24 +186,44 @@ export const startSerialPort = ({
           
           // Handle vitals data message
           else if (data.type === "vitals") {
-            // Update device status
-            if (data.deviceId) {
-              updateDevice(data.deviceId, data.deviceName || data.deviceId, data.macAddress || "");
-            }
+            // Don't update device here - device_status messages handle device tracking
+            // Updating device from vitals causes duplicate device entries
             
             // Process vitals data - แปลงเป็นรูปแบบที่ handleCombinedVitals ต้องการ
             const vitalsPayload: any = {
               idcard: data.idcard || "",
-              timestamp: data.data?.timestamp || Date.now()
+              timestamp: data.timestamp || data.data?.timestamp || Date.now()
             };
+
+            // รองรับ payload แบบ batch/combined ที่ส่ง field ตรง ๆ
+            if (data.weight != null) vitalsPayload.weight = data.weight;
+            if (data.height != null) vitalsPayload.height = data.height;
+            if (data.bp != null) vitalsPayload.bp = data.bp;
+            if (data.bp2 != null) vitalsPayload.bp2 = data.bp2;
+            if (data.pressure != null) vitalsPayload.pressure = data.pressure;
+            if (data.temp != null) vitalsPayload.temp = data.temp;
+            if (data.temperature != null) vitalsPayload.temperature = data.temperature;
+            if (data.pulse != null) vitalsPayload.pulse = data.pulse;
+            if (data.spo2 != null) vitalsPayload.spo2 = data.spo2;
             
-            // แมป deviceType กับ field ที่ถูกค้อง
+            // Handle nested data structure from combined measurements (weight_height, blood_pressure)
+            if (data.data && typeof data.data === 'object') {
+              if (data.data.weight != null) vitalsPayload.weight = data.data.weight;
+              if (data.data.height != null) vitalsPayload.height = data.data.height;
+              if (data.data.bp != null) vitalsPayload.bp = data.data.bp;
+              if (data.data.bp2 != null) vitalsPayload.bp2 = data.data.bp2;
+              if (data.data.temp != null) vitalsPayload.temp = data.data.temp;
+              if (data.data.temperature != null) vitalsPayload.temperature = data.data.temperature;
+              if (data.data.pulse != null) vitalsPayload.pulse = data.data.pulse;
+              if (data.data.spo2 != null) vitalsPayload.spo2 = data.data.spo2;
+            }
+            
+            // แมป deviceType กับ field ที่ถูกค้อง (สำหรับ single value measurements)
             if (data.deviceType === "bp") {
               vitalsPayload.bp = data.data?.value || null;
               vitalsPayload.pressure = data.data?.value || null;  // alias
             } else if (data.deviceType === "bp2") {
-              vitalsPayload.bp = data.data?.value || null;
-              vitalsPayload.pressure = data.data?.value || null;  // alias
+              vitalsPayload.bp2 = data.data?.value || null;
             } else if (data.deviceType === "temp") {
               vitalsPayload.temp = data.data?.value || null;
               vitalsPayload.temperature = data.data?.value || null;  // alias
@@ -170,6 +236,7 @@ export const startSerialPort = ({
             } else if (data.deviceType === "height") {
               vitalsPayload.height = data.data?.value || null;
             }
+            // weight_height deviceType is already handled above in nested data structure section
             
             onMessage?.({
               deviceId: data.deviceId || "unknown",
@@ -178,11 +245,11 @@ export const startSerialPort = ({
             });
           }
           
-          // Handle legacy device type messages
-          else if (data.deviceType && data.idcard) {
-            if (data.deviceId) {
-              updateDevice(data.deviceId, data.deviceName || data.deviceId, data.macAddress || "");
-            }
+          // Handle legacy device type messages (deviceType-based routing)
+          else if (data.deviceType && 'idcard' in data) {
+            // Accept any deviceType with idcard field (even if empty string)
+            // This handles: blood_pressure, weight_height, etc.
+            writeLog?.(`[SERIAL-PARSE] DeviceType: ${data.deviceType}, IDCard: ${data.idcard || '(empty)'}`);
             
             onMessage?.({
               deviceId: data.deviceId || "unknown",
@@ -197,19 +264,34 @@ export const startSerialPort = ({
 
       port.on("error", (err) => {
         console.error("[SERIAL] Port error:", err.message);
+        writeLog?.(`[SERIAL] Port error: ${err.message}`);
         isConnected = false;
+        
+        // Clear all devices on error
+        devices.clear();
+        onDevicesUpdated?.(Array.from(devices.values()));
         onStatusChanged?.({ connected: false, portName });
+        
+        // Try to reconnect after error
+        if (!reconnectInterval && !isReconnecting) {
+          writeLog?.(`[SERIAL] Will attempt to reconnect...`);
+          startReconnect();
+        }
       });
 
       port.on("close", () => {
-        console.log("[SERIAL] Port closed");
+        writeLog?.(`[SERIAL] Port closed`);
         isConnected = false;
-        onStatusChanged?.({ connected: false, portName });
         
         if (deviceCheckInterval) {
           clearInterval(deviceCheckInterval);
           deviceCheckInterval = null;
         }
+        
+        // Clear all devices on disconnect
+        devices.clear();
+        onDevicesUpdated?.(Array.from(devices.values()));
+        onStatusChanged?.({ connected: false, portName });
         
         // Start auto-reconnect
         startReconnect();
@@ -226,7 +308,7 @@ export const startSerialPort = ({
   const startReconnect = () => {
     if (reconnectInterval || isReconnecting) return;
     
-    console.log("[SERIAL] Starting auto-reconnect attempts...");
+    writeLog?.(`[SERIAL] Starting auto-reconnect attempts...`);
     reconnectInterval = setInterval(attemptReconnect, 5000); // Try every 5 seconds
   };
 
@@ -241,8 +323,18 @@ export const startSerialPort = ({
       const portExists = availablePorts.some(p => p.path === portName);
       
       if (portExists) {
-        console.log(`[SERIAL] Port ${portName} detected, attempting reconnect...`);
+        writeLog?.(`[SERIAL] Port ${portName} detected, attempting reconnect...`);
+        
+        // Stop reconnect interval before attempting connection
+        if (reconnectInterval) {
+          clearInterval(reconnectInterval);
+          reconnectInterval = null;
+        }
+        
+        isReconnecting = false;
         connect();
+      } else {
+        isReconnecting = false;
       }
     } catch (error) {
       console.error("[SERIAL] Reconnect check failed:", error);
@@ -250,32 +342,58 @@ export const startSerialPort = ({
     }
   };
 
-  const disconnect = () => {
-    // Stop reconnect attempts
-    if (reconnectInterval) {
-      clearInterval(reconnectInterval);
-      reconnectInterval = null;
-    }
-    
-    if (port && port.isOpen) {
-      port.close((err) => {
-        if (err) {
-          console.error("[SERIAL] Error closing port:", err.message);
+  const disconnect = (): Promise<void> => {
+    return new Promise((resolve) => {
+      writeLog?.(`[SERIAL] Disconnecting from ${portName}...`);
+      
+      // Stop reconnect attempts
+      if (reconnectInterval) {
+        clearInterval(reconnectInterval);
+        reconnectInterval = null;
+      }
+      
+      if (deviceCheckInterval) {
+        clearInterval(deviceCheckInterval);
+        deviceCheckInterval = null;
+      }
+      
+      devices.clear();
+      isConnected = false;
+      isReconnecting = false;
+      
+      // Notify about disconnection
+      onDevicesUpdated?.(Array.from(devices.values()));
+      onStatusChanged?.({ connected: false, portName });
+      
+      if (port) {
+        // Remove all listeners to prevent memory leaks
+        port.removeAllListeners();
+        
+        if (port.isOpen) {
+          port.close((err) => {
+            if (err) {
+              console.error("[SERIAL] Error closing port:", err.message);
+            }
+            writeLog?.("[SERIAL] Port closed successfully");
+            port = null;
+            resolve();
+          });
+        } else {
+          port = null;
+          resolve();
         }
-      });
-    }
-    
-    if (deviceCheckInterval) {
-      clearInterval(deviceCheckInterval);
-      deviceCheckInterval = null;
-    }
-    
-    devices.clear();
-    isConnected = false;
+      } else {
+        resolve();
+      }
+    });
   };
 
   const getDevices = () => {
     return Array.from(devices.values());
+  };
+
+  const getIsConnected = () => {
+    return isConnected;
   };
 
   // Auto-connect
@@ -283,9 +401,9 @@ export const startSerialPort = ({
 
   return {
     port: port!,
-    isConnected,
+    isConnected: getIsConnected,
     getDevices,
-    disconnect
+    disconnect: disconnect as () => Promise<void>
   };
 };
 

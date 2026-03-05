@@ -14,23 +14,34 @@ export const useSerialStatus = () => {
   useEffect(() => {
     let mounted = true;
     
-    // Get initial status
-    ipc.invoke<SerialStatus>("serial:get-status").then((data) => {
+    const loadStatus = async () => {
+      const data = await ipc.invoke<SerialStatus>("serial:get-status");
       if (mounted) {
         setStatus(data);
       }
-    });
+    };
+    
+    // Load initial status
+    loadStatus();
 
-    // Listen for status updates
+    // Listen for real-time status updates
     const unsubscribe = ipc.on<SerialStatus>("serial:status", (data) => {
       if (mounted) {
         setStatus(data);
       }
     });
+    
+    // Polling ทุก 5 วินาที (เพิ่มความแน่นอน)
+    const pollInterval = setInterval(() => {
+      if (mounted) {
+        loadStatus();
+      }
+    }, 5000);
 
     return () => {
       mounted = false;
       unsubscribe();
+      clearInterval(pollInterval);
     };
   }, []);
 

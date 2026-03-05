@@ -3,11 +3,14 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 type ActiveSessionCardProps = {
   session?: {
     idcard?: string | null;
+    pid?: string | number | null;
     visitno?: string | number | null;
+    pcucode?: string | null;
     last_update?: string | null;
     weight?: string | number | null;
     height?: string | number | null;
     pressure?: string | null;
+    pressure2?: string | null;
     temperature?: string | number | null;
     pulse?: string | number | null;
   } | null;
@@ -37,6 +40,19 @@ export function ActiveSessionCard({ session }: ActiveSessionCardProps) {
     }).format(parsed);
   };
 
+  const formatBP = (pressure?: string | null, pressure2?: string | null) => {
+    if (pressure && pressure2) {
+      return `${pressure}/${pressure2}`;
+    }
+    if (pressure) {
+      return pressure;
+    }
+    if (pressure2) {
+      return pressure2;
+    }
+    return "--";
+  };
+
   return (
     <Card>
       <CardHeader>
@@ -47,6 +63,10 @@ export function ActiveSessionCard({ session }: ActiveSessionCardProps) {
         <div className="flex items-center justify-between">
           <span className="text-muted-foreground">ID Card</span>
           <span className="font-medium">{session?.idcard ?? "--"}</span>
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-muted-foreground">PID</span>
+          <span className="font-medium">{session?.pid ?? "--"}</span>
         </div>
         <div className="flex items-center justify-between">
           <span className="text-muted-foreground">Visit No</span>
@@ -66,7 +86,7 @@ export function ActiveSessionCard({ session }: ActiveSessionCardProps) {
         </div>
         <div className="flex items-center justify-between">
           <span className="text-muted-foreground">BP</span>
-          <span className="font-medium">{session?.pressure ?? "--"}</span>
+          <span className="font-medium">{formatBP(session?.pressure, session?.pressure2)}</span>
         </div>
         <div className="flex items-center justify-between">
           <span className="text-muted-foreground">Temperature</span>
